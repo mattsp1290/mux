@@ -14,6 +14,6 @@ mod harness;
 // All tests are #[ignore] stubs until the integration crate is wired up (mux-qz4).
 //
 //   mod init;      (mux-3bv follow-on)
-//   mod host;      (mux-av5)
+mod host;     // mux-av5: host test/trust scenarios
 mod agent;    // mux-zpx: deploy/logs/stop scenarios
 //   mod session;   (mux-qz4)
