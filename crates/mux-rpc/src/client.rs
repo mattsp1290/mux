@@ -1,25 +1,23 @@
 //! RPC client over SSH-forwarded streamlocal and TCP fallback channels.
 //!
-//! Wire format: `[u32 LE length][UTF-8 JSON body]`
+//! Wire format: `[u32 LE length][UTF-8 JSON body]` — delegated to `codec`.
 
 use std::path::PathBuf;
 use std::time::Duration;
 
 use mux_core::{error::MuxError, types::TransportMode};
 use serde::de::DeserializeOwned;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 
+use crate::codec;
 use crate::schema::{
     CreateSessionRequest, CreateSessionResponse, GetSessionRequest, GetSessionResponse,
     HealthRequest, HealthResponse, KillSessionRequest, KillSessionResponse, ListSessionsRequest,
     ListSessionsResponse, Request, RpcResult, ShutdownRequest, ShutdownResponse,
-    StreamSessionEventsRequest,
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-const MAX_FRAME_LEN: usize = 4 * 1024 * 1024;
 
 // ── Endpoint ──────────────────────────────────────────────────────────────────
 
@@ -80,32 +78,36 @@ impl RpcClient {
     // ── Internal transport ────────────────────────────────────────────────────
 
     async fn send_request(&self, req: Request) -> Result<Vec<u8>, MuxError> {
-        let json = serde_json::to_vec(&req)
+        let json = codec::encode(&req)
             .map_err(|e| MuxError::RpcError(e.to_string()))?;
-        let frame_len = u32::try_from(json.len())
-            .map_err(|_| MuxError::RpcError("request too large to frame".into()))?;
 
+        let display = self.endpoint_display();
         timeout(REQUEST_TIMEOUT, async {
             match &self.endpoint {
                 RpcEndpoint::Streamlocal(path) => {
                     let mut stream = UnixStream::connect(path).await.map_err(|_| {
                         MuxError::ConnectionRefused(path.display().to_string())
                     })?;
-                    write_frame(&mut stream, frame_len, &json).await?;
-                    read_frame(&mut stream).await
+                    codec::write_message(&mut stream, &json).await
+                        .map_err(|e| MuxError::RpcError(e.to_string()))?;
+                    codec::read_message(&mut stream).await
+                        .map_err(|e| MuxError::RpcError(e.to_string()))?
+                        .ok_or_else(|| MuxError::RpcError("server closed connection".into()))
                 }
                 RpcEndpoint::Tcp { host, port } => {
                     let addr = format!("{host}:{port}");
-                    let mut stream = TcpStream::connect(&addr)
-                        .await
+                    let mut stream = TcpStream::connect(&addr).await
                         .map_err(|_| MuxError::ConnectionRefused(addr.clone()))?;
-                    write_frame(&mut stream, frame_len, &json).await?;
-                    read_frame(&mut stream).await
+                    codec::write_message(&mut stream, &json).await
+                        .map_err(|e| MuxError::RpcError(e.to_string()))?;
+                    codec::read_message(&mut stream).await
+                        .map_err(|e| MuxError::RpcError(e.to_string()))?
+                        .ok_or_else(|| MuxError::RpcError("server closed connection".into()))
                 }
             }
         })
         .await
-        .map_err(|_| MuxError::ConnectionTimeout(self.endpoint_display()))?
+        .map_err(|_| MuxError::ConnectionTimeout(display))?
     }
 
     // ── Public operations ─────────────────────────────────────────────────────
@@ -156,10 +158,7 @@ impl RpcClient {
     }
 
     pub async fn stream_session_events(&self) -> Result<(), MuxError> {
-        // Streaming is not implemented in v0.1.
-        let _bytes = self
-            .send_request(Request::StreamSessionEvents(StreamSessionEventsRequest {}))
-            .await?;
+        // v0.1: streaming unimplemented; skip the round-trip entirely.
         Err(MuxError::RpcError("streaming not implemented".into()))
     }
 
@@ -169,10 +168,19 @@ impl RpcClient {
     ///
     /// Returns `true` if the agent became healthy within the allotted time,
     /// `false` if the deadline was reached without a successful response.
+    ///
+    /// Each probe is bounded by the remaining budget so the total wall-clock
+    /// time is at most `max_duration + 1 sleep interval` regardless of the
+    /// per-request timeout.
     pub async fn poll_until_healthy(&self, max_duration: Duration) -> bool {
         let deadline = tokio::time::Instant::now() + max_duration;
         loop {
-            if self.health().await.is_ok() {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            let probe = timeout(remaining, self.health());
+            if matches!(probe.await, Ok(Ok(_))) {
                 return true;
             }
             if tokio::time::Instant::now() >= deadline {
@@ -181,44 +189,6 @@ impl RpcClient {
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
     }
-}
-
-// ── Frame helpers ─────────────────────────────────────────────────────────────
-
-async fn write_frame<W: AsyncWriteExt + Unpin>(
-    stream: &mut W,
-    len: u32,
-    body: &[u8],
-) -> Result<(), MuxError> {
-    stream
-        .write_all(&len.to_le_bytes())
-        .await
-        .map_err(|e| MuxError::RpcError(format!("write length prefix: {e}")))?;
-    stream
-        .write_all(body)
-        .await
-        .map_err(|e| MuxError::RpcError(format!("write body: {e}")))?;
-    Ok(())
-}
-
-async fn read_frame<R: AsyncReadExt + Unpin>(stream: &mut R) -> Result<Vec<u8>, MuxError> {
-    let mut len_buf = [0u8; 4];
-    stream
-        .read_exact(&mut len_buf)
-        .await
-        .map_err(|e| MuxError::RpcError(format!("read length prefix: {e}")))?;
-    let len = u32::from_le_bytes(len_buf) as usize;
-    if len == 0 || len > MAX_FRAME_LEN {
-        return Err(MuxError::RpcError(format!(
-            "invalid frame length: {len} (max {MAX_FRAME_LEN})"
-        )));
-    }
-    let mut body = vec![0u8; len];
-    stream
-        .read_exact(&mut body)
-        .await
-        .map_err(|e| MuxError::RpcError(format!("read body: {e}")))?;
-    Ok(body)
 }
 
 // ── Response decode ───────────────────────────────────────────────────────────
@@ -238,112 +208,85 @@ mod tests {
     use super::*;
     use crate::schema::HealthResponse;
     use std::sync::Arc;
-    // tokio AsyncWriteExt and AsyncReadExt are used via the write_all/read_exact
-    // methods on streams returned by the listener helpers — no explicit import needed.
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, UnixListener};
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    /// Build a framed `HealthResponse { ok: true }` payload.
-    fn health_ok_frame() -> Vec<u8> {
-        let body = serde_json::to_vec(&HealthResponse { ok: true }).unwrap();
-        let len = (body.len() as u32).to_le_bytes();
+    async fn health_ok_frame() -> Vec<u8> {
+        let body = codec::encode(&HealthResponse { ok: true }).unwrap();
         let mut frame = Vec::with_capacity(4 + body.len());
-        frame.extend_from_slice(&len);
+        frame.extend_from_slice(&(body.len() as u32).to_le_bytes());
         frame.extend_from_slice(&body);
         frame
     }
 
-    /// Spawn a Unix socket echo server that reads one request frame, then
-    /// responds with a `HealthResponse { ok: true }` frame, then closes.
+    /// Spawn a Unix socket echo server: reads one request, responds with health ok.
     async fn spawn_unix_echo_server(path: &std::path::Path) {
         let listener = UnixListener::bind(path).unwrap();
         tokio::spawn(async move {
             if let Ok((mut stream, _)) = listener.accept().await {
-                // Consume the request frame (length + body).
-                let mut len_buf = [0u8; 4];
-                let _ = stream.read_exact(&mut len_buf).await;
-                let body_len = u32::from_le_bytes(len_buf) as usize;
-                let mut _body = vec![0u8; body_len];
-                let _ = stream.read_exact(&mut _body).await;
-
-                // Reply with health ok.
-                let _ = stream.write_all(&health_ok_frame()).await;
+                let _ = codec::read_message(&mut stream).await;
+                let frame = health_ok_frame().await;
+                let _ = stream.write_all(&frame).await;
             }
         });
     }
 
-    /// Spawn a TCP echo server that reads one request frame, responds, then closes.
-    /// Returns the actual bound port.
+    /// Spawn a TCP echo server: reads one request, responds, closes. Returns port.
     async fn spawn_tcp_echo_server() -> u16 {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
             if let Ok((mut stream, _)) = listener.accept().await {
-                let mut len_buf = [0u8; 4];
-                let _ = stream.read_exact(&mut len_buf).await;
-                let body_len = u32::from_le_bytes(len_buf) as usize;
-                let mut _body = vec![0u8; body_len];
-                let _ = stream.read_exact(&mut _body).await;
-
-                let _ = stream.write_all(&health_ok_frame()).await;
+                let _ = codec::read_message(&mut stream).await;
+                let frame = health_ok_frame().await;
+                let _ = stream.write_all(&frame).await;
             }
         });
         port
     }
 
-    // ── 1. write_frame / read_frame roundtrip ─────────────────────────────────
+    // ── 1. codec roundtrip via duplex ─────────────────────────────────────────
 
     #[tokio::test]
-    async fn frame_roundtrip_via_duplex() {
+    async fn codec_roundtrip_via_duplex() {
         let (mut client_half, mut server_half) = tokio::io::duplex(4096);
-
         let body = b"hello, frame!";
-        let len = body.len() as u32;
-        write_frame(&mut client_half, len, body).await.unwrap();
-
-        // Drop client half so EOF signals are sent after writing.
+        codec::write_message(&mut client_half, body).await.unwrap();
         drop(client_half);
-
-        let received = read_frame(&mut server_half).await.unwrap();
+        let received = codec::read_message(&mut server_half).await.unwrap().unwrap();
         assert_eq!(received, body);
     }
 
-    // ── 2. send_request via streamlocal echo server ───────────────────────────
+    // ── 2. health over streamlocal ────────────────────────────────────────────
 
     #[tokio::test]
     async fn send_request_streamlocal_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let socket_path = dir.path().join("test.sock");
-
         spawn_unix_echo_server(&socket_path).await;
-        // Give the server a tick to bind.
-        tokio::time::sleep(Duration::from_millis(10)).await;
-
         let client = RpcClient::streamlocal(&socket_path);
         let resp = client.health().await.unwrap();
         assert!(resp.ok);
     }
 
-    // ── 3. send_request via TCP echo server ───────────────────────────────────
+    // ── 3. health over TCP ────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn send_request_tcp_roundtrip() {
         let port = spawn_tcp_echo_server().await;
-        tokio::time::sleep(Duration::from_millis(10)).await;
-
         let client = RpcClient::tcp("127.0.0.1", port);
         let resp = client.health().await.unwrap();
         assert!(resp.ok);
     }
 
-    // ── 4. Connection refused → MuxError::ConnectionRefused ──────────────────
+    // ── 4. connection refused ─────────────────────────────────────────────────
 
     #[tokio::test]
     async fn connection_refused_unix() {
         let dir = tempfile::tempdir().unwrap();
         let socket_path = dir.path().join("nonexistent.sock");
-
         let client = RpcClient::streamlocal(&socket_path);
         let err = client.health().await.unwrap_err();
         assert!(
@@ -354,117 +297,133 @@ mod tests {
 
     #[tokio::test]
     async fn connection_refused_tcp() {
-        // Port 1 is privileged and always refused on Linux.
         let client = RpcClient::tcp("127.0.0.1", 1);
         let err = client.health().await.unwrap_err();
-        // The timeout may fire before refused depending on the OS, accept either.
         assert!(
-            matches!(
-                err,
-                MuxError::ConnectionRefused(_) | MuxError::ConnectionTimeout(_)
-            ),
+            matches!(err, MuxError::ConnectionRefused(_) | MuxError::ConnectionTimeout(_)),
             "expected ConnectionRefused or ConnectionTimeout, got: {err:?}"
         );
     }
 
-    // ── 5. poll_until_healthy returns true when server is up ──────────────────
+    // ── 5. poll_until_healthy returns true when up ────────────────────────────
 
     #[tokio::test]
     async fn poll_until_healthy_returns_true_when_up() {
-        // The TCP echo server only handles one connection. For polling we need a
-        // server that stays up for multiple probes; spawn one that loops.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let listener = Arc::new(listener);
         let listener_clone = Arc::clone(&listener);
         tokio::spawn(async move {
-            // Accept a fixed number of connections so the test can't stall.
             for _ in 0..5 {
                 if let Ok((mut stream, _)) = listener_clone.accept().await {
-                    let mut len_buf = [0u8; 4];
-                    let _ = stream.read_exact(&mut len_buf).await;
-                    let body_len = u32::from_le_bytes(len_buf) as usize;
-                    let mut _body = vec![0u8; body_len];
-                    let _ = stream.read_exact(&mut _body).await;
-                    let _ = stream.write_all(&health_ok_frame()).await;
+                    let _ = codec::read_message(&mut stream).await;
+                    let frame = health_ok_frame().await;
+                    let _ = stream.write_all(&frame).await;
                 }
             }
         });
-        tokio::time::sleep(Duration::from_millis(10)).await;
-
         let client = RpcClient::tcp("127.0.0.1", port);
         let healthy = client.poll_until_healthy(Duration::from_secs(5)).await;
         assert!(healthy);
     }
 
-    // ── 6. poll_until_healthy returns false when server never responds ─────────
+    // ── 6. poll_until_healthy returns false when never up ────────────────────
 
     #[tokio::test]
     async fn poll_until_healthy_returns_false_when_down() {
-        // Use a port that will always refuse connections.
         let client = RpcClient::tcp("127.0.0.1", 1);
-        // Use a short max_duration so the test finishes quickly.
         let healthy = client.poll_until_healthy(Duration::from_secs(2)).await;
         assert!(!healthy);
     }
 
-    // ── 7. Frame too large rejected ───────────────────────────────────────────
+    // ── 7. oversized response rejected by codec ───────────────────────────────
 
     #[tokio::test]
-    async fn read_frame_rejects_too_large() {
+    async fn oversized_frame_rejected() {
         let (mut writer, mut reader) = tokio::io::duplex(16);
-        // Write a length > MAX_FRAME_LEN.
-        let huge = (MAX_FRAME_LEN + 1) as u32;
-        writer.write_all(&huge.to_le_bytes()).await.unwrap();
+        let huge = (codec::MAX_MESSAGE_BYTES + 1).to_le_bytes();
+        writer.write_all(&huge).await.unwrap();
         drop(writer);
+        // codec::read_message returns Err on oversized length
+        let result = codec::read_message(&mut reader).await;
+        assert!(result.is_err(), "expected error for oversized frame");
+    }
 
-        let err = read_frame(&mut reader).await.unwrap_err();
+    // ── 8. server closes connection mid-request ───────────────────────────────
+
+    #[tokio::test]
+    async fn server_closed_connection_returns_rpc_error() {
+        // Server accepts, reads request, then closes without responding.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let _ = codec::read_message(&mut stream).await;
+                drop(stream); // close without responding
+            }
+        });
+        let client = RpcClient::tcp("127.0.0.1", port);
+        let err = client.health().await.unwrap_err();
         assert!(
             matches!(err, MuxError::RpcError(_)),
-            "expected RpcError for oversized frame, got: {err:?}"
+            "expected RpcError for server-closed connection, got: {err:?}"
         );
     }
 
-    #[tokio::test]
-    async fn read_frame_rejects_zero_length() {
-        let (mut writer, mut reader) = tokio::io::duplex(16);
-        writer.write_all(&0u32.to_le_bytes()).await.unwrap();
-        drop(writer);
+    // ── 9. error response decoded as AgentError ───────────────────────────────
 
-        let err = read_frame(&mut reader).await.unwrap_err();
+    #[tokio::test]
+    async fn error_response_decoded_as_agent_error() {
+        use crate::schema::RpcError;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let _ = codec::read_message(&mut stream).await;
+                let err_body = codec::encode(&RpcError::not_found("session missing")).unwrap();
+                let mut frame = (err_body.len() as u32).to_le_bytes().to_vec();
+                frame.extend_from_slice(&err_body);
+                let _ = stream.write_all(&frame).await;
+            }
+        });
+        let client = RpcClient::tcp("127.0.0.1", port);
+        let err = client.health().await.unwrap_err();
         assert!(
-            matches!(err, MuxError::RpcError(_)),
-            "expected RpcError for zero-length frame, got: {err:?}"
+            matches!(err, MuxError::AgentError(_)),
+            "expected AgentError, got: {err:?}"
         );
     }
 
-    // ── 8. from_transport dispatches correctly ────────────────────────────────
+    // ── 10. from_transport dispatches correctly ───────────────────────────────
 
     #[test]
     fn from_transport_streamlocal_sets_unix_endpoint() {
         let client = RpcClient::from_transport(
-            TransportMode::Streamlocal,
-            "/tmp/mux.sock",
-            "127.0.0.1",
-            9000,
+            TransportMode::Streamlocal, "/tmp/mux.sock", "127.0.0.1", 9000,
         );
         let display = client.endpoint_display();
-        assert!(
-            display.starts_with("unix:"),
-            "expected unix: prefix, got: {display}"
-        );
-        assert!(display.contains("mux.sock"));
+        assert!(display.starts_with("unix:") && display.contains("mux.sock"));
     }
 
     #[test]
     fn from_transport_tcp_sets_tcp_endpoint() {
         let client = RpcClient::from_transport(
-            TransportMode::Tcp,
-            "/tmp/mux.sock",
-            "127.0.0.1",
-            9001,
+            TransportMode::Tcp, "/tmp/mux.sock", "127.0.0.1", 9001,
         );
-        let display = client.endpoint_display();
-        assert_eq!(display, "127.0.0.1:9001");
+        assert_eq!(client.endpoint_display(), "127.0.0.1:9001");
+    }
+
+    // ── 11. stream_session_events short-circuits ──────────────────────────────
+
+    #[tokio::test]
+    async fn stream_session_events_never_connects() {
+        // Point to a nonexistent server — should fail immediately without connecting.
+        let client = RpcClient::tcp("127.0.0.1", 1);
+        let err = client.stream_session_events().await.unwrap_err();
+        // Returns RpcError("streaming not implemented") without attempting connection.
+        assert!(
+            matches!(&err, MuxError::RpcError(msg) if msg.contains("not implemented")),
+            "expected 'not implemented' RpcError, got: {err:?}"
+        );
     }
 }
