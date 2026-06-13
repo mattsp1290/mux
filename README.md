@@ -19,15 +19,25 @@ proto/          # RPC protocol definitions
 
 ## Development commands
 
+Run the full CI gate (fmt-check + clippy + unit tests) with either:
+
 ```sh
-# Format check
+make check
+# or
+./scripts/check.sh
+```
+
+Individual commands:
+
+```sh
+# Format check (no-op on CI; run `cargo fmt --all` to fix locally)
 cargo fmt --check
 
-# Lint (warnings are errors)
-cargo clippy -- -D warnings
+# Lint (warnings are errors; --all-targets includes tests and examples)
+cargo clippy --all-targets -- -D warnings
 
 # Unit tests
-cargo test
+cargo test --workspace
 
 # Build both binaries
 cargo build --bins
@@ -35,3 +45,5 @@ cargo build --bins
 # Release build
 cargo build --release --bins
 ```
+
+See `Makefile` for all available targets (`make fmt`, `make lint`, `make test`, `make build`, etc.).

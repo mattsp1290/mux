@@ -159,7 +159,10 @@ mod tests {
     fn host_alias_deserialize_rejects_invalid() {
         let json = r#""has.dots""#;
         let result: Result<HostAlias, _> = serde_json::from_str(json);
-        assert!(result.is_err(), "deserialization should reject invalid alias");
+        assert!(
+            result.is_err(),
+            "deserialization should reject invalid alias"
+        );
     }
 
     #[test]
