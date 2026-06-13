@@ -96,7 +96,8 @@ pub struct BoundRpcServer<T = TmuxAdapter> {
     listener: TcpListener,
     tmux: Arc<T>,
     ownership: OwnershipMap,
-    pub shutdown_flag: Arc<AtomicBool>,
+    // pub(crate): needed by tests in this file; no external consumer exists.
+    pub(crate) shutdown_flag: Arc<AtomicBool>,
     shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
 }
@@ -117,6 +118,7 @@ impl RpcServer {
     }
 }
 
+#[allow(private_bounds)] // TmuxOps is intentionally sealed; T is never nameable outside this crate.
 impl<T: TmuxOps> RpcServer<T> {
     pub fn with_backend(bind_addr: impl Into<String>, tmux: T) -> Self {
         Self {
@@ -139,6 +141,7 @@ impl<T: TmuxOps> RpcServer<T> {
     }
 }
 
+#[allow(private_bounds)] // TmuxOps is intentionally sealed; T is never nameable outside this crate.
 impl<T: TmuxOps> BoundRpcServer<T> {
     pub fn local_addr(&self) -> std::net::SocketAddr {
         self.listener.local_addr().expect("listener has a local addr")
@@ -243,6 +246,14 @@ async fn handle_connection<T: TmuxOps>(
                     let tmux_name = format!("mux-{}", req.shortname);
                     let workdir = format!("{}/{}", req.workdir_parent, req.repo_leaf);
 
+                    // Reject duplicate UUIDs before touching tmux to avoid orphaned sessions.
+                    let already_exists = ownership.lock().unwrap().contains_key(&req.uuid);
+                    if already_exists {
+                        let err: RpcResult<CreateSessionResponse> =
+                            RpcResult::Err(RpcError::internal("session with this uuid already exists"));
+                        serde_json::to_vec(&err).unwrap_or_default()
+                    } else {
+
                     match tmux.new_session(&tmux_name, &workdir).await {
                         Err(e) => {
                             let err: RpcResult<CreateSessionResponse> =
@@ -272,6 +283,7 @@ async fn handle_connection<T: TmuxOps>(
                             serde_json::to_vec(&resp).unwrap_or_default()
                         }
                     }
+                    } // end if already_exists else
                 }
             }
 
@@ -477,6 +489,8 @@ mod tests {
         new_session_error: Option<String>,
         /// Error to return from kill_session (None = Ok(())).
         kill_session_error: Option<String>,
+        /// Error to return from list_sessions (None = Ok(sessions)).
+        list_sessions_error: Option<String>,
         /// Calls recorded for new_session: (name, workdir).
         new_session_calls: Arc<Mutex<Vec<(String, String)>>>,
         /// Calls recorded for kill_session: name.
@@ -491,6 +505,7 @@ mod tests {
                 live_sessions: Arc::new(Mutex::new(Vec::new())),
                 new_session_error: None,
                 kill_session_error: None,
+                list_sessions_error: None,
                 new_session_calls: Arc::new(Mutex::new(Vec::new())),
                 kill_session_calls: Arc::new(Mutex::new(Vec::new())),
                 list_sessions_count: Arc::new(AtomicUsize::new(0)),
@@ -509,6 +524,11 @@ mod tests {
 
         fn with_kill_session_error(mut self, msg: impl Into<String>) -> Self {
             self.kill_session_error = Some(msg.into());
+            self
+        }
+
+        fn with_list_sessions_error(mut self, msg: impl Into<String>) -> Self {
+            self.list_sessions_error = Some(msg.into());
             self
         }
     }
@@ -559,8 +579,16 @@ mod tests {
 
         fn list_sessions(&self) -> BoxFut<'_, Result<Vec<TmuxSessionInfo>, TmuxError>> {
             self.list_sessions_count.fetch_add(1, Ordering::SeqCst);
-            let sessions = self.live_sessions.lock().unwrap().clone();
-            Box::pin(async move { Ok(sessions) })
+            let result = if let Some(ref msg) = self.list_sessions_error {
+                Err(TmuxError::TmuxFailed {
+                    command: vec!["tmux".to_owned()],
+                    exit_code: Some(1),
+                    stderr: msg.clone(),
+                })
+            } else {
+                Ok(self.live_sessions.lock().unwrap().clone())
+            };
+            Box::pin(async move { result })
         }
     }
 
@@ -1169,11 +1197,185 @@ mod tests {
         let resp = send_request(&mut stream, &serde_json::json!({"op": "Shutdown"})).await;
         assert!(resp.get("error").is_none(), "shutdown must return ok, got: {resp}");
 
-        // Give the accept loop time to process the shutdown signal.
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        // Poll until connect fails — avoids a fixed sleep that can be flaky under load.
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(500);
+        loop {
+            if TcpStream::connect(addr).await.is_err() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "server did not stop accepting connections within 500ms"
+            );
+            tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+        }
+    }
 
-        // The server should now refuse new connections.
-        let result = TcpStream::connect(addr).await;
-        assert!(result.is_err(), "server must refuse connections after shutdown");
+    // ── CreateSession duplicate UUID ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn create_session_duplicate_uuid_returns_internal_error() {
+        let addr = start_test_server().await;
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+
+        let req = serde_json::json!({
+            "op": "CreateSession",
+            "uuid": "dup-uuid",
+            "shortname": "s",
+            "repo_slug": "r",
+            "branch": "main",
+            "workdir_parent": "/tmp",
+            "repo_leaf": "r"
+        });
+
+        let first = send_request(&mut stream, &req).await;
+        assert!(first.get("error").is_none(), "first create must succeed: {first}");
+
+        let second = send_request(&mut stream, &req).await;
+        assert_eq!(
+            second["error"], "internal",
+            "duplicate uuid must return internal error, got: {second}"
+        );
+        assert!(
+            second["message"].as_str().unwrap().contains("already exists"),
+            "message should mention 'already exists', got: {}",
+            second["message"]
+        );
+    }
+
+    // ── KillSession generic tmux error ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn kill_session_generic_tmux_error_sets_tmux_killed_false() {
+        // A non-"not found" tmux error → tmux_killed=false, but entry is still removed.
+        let mock = MockTmuxOps::new().with_kill_session_error("connection failed");
+        let addr = start_mock_server(mock).await;
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+
+        send_request(
+            &mut stream,
+            &serde_json::json!({
+                "op": "CreateSession",
+                "uuid": "tmux-err-uuid",
+                "shortname": "s",
+                "repo_slug": "r",
+                "branch": "main",
+                "workdir_parent": "/tmp",
+                "repo_leaf": "r"
+            }),
+        )
+        .await;
+
+        let resp = send_request(
+            &mut stream,
+            &serde_json::json!({"op": "KillSession", "uuid": "tmux-err-uuid", "repo_slug": "r"}),
+        )
+        .await;
+        assert!(resp.get("error").is_none(), "kill must still succeed at RPC level: {resp}");
+        assert_eq!(resp["tmux_killed"], false, "generic tmux error → tmux_killed=false");
+
+        // Ownership entry must be removed regardless.
+        let get = send_request(
+            &mut stream,
+            &serde_json::json!({"op": "GetSession", "uuid": "tmux-err-uuid"}),
+        )
+        .await;
+        assert_eq!(get["error"], "not_found", "entry must be removed after kill");
+    }
+
+    // ── ListSessions tmux error ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn list_sessions_tmux_error_returns_tmux_error() {
+        let mock = MockTmuxOps::new().with_list_sessions_error("tmux: no server running");
+        let addr = start_mock_server(mock).await;
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let resp = send_request(&mut stream, &serde_json::json!({"op": "ListSessions"})).await;
+        assert_eq!(resp["error"], "tmux_error", "list_sessions error must propagate: {resp}");
+    }
+
+    #[tokio::test]
+    async fn get_session_list_sessions_error_returns_tmux_error() {
+        let mock = MockTmuxOps::new().with_list_sessions_error("tmux: no server running");
+        let addr = start_mock_server(mock).await;
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+
+        // Use a fresh mock without the error for CreateSession so it succeeds.
+        // Instead, create the entry in this server's ownership map first via a server
+        // that doesn't error on new_session, then test via the error-injecting server.
+        // Simpler: just verify the error path is reachable by calling GetSession on
+        // a known-registered session. But we can't create one here without list_sessions
+        // working (new_session still works). Let's create via a separate connection
+        // to a non-error mock, then verify GetSession on this one hits the error.
+        // Actually: the mock controls list_sessions but not new_session.
+        // Create via this server (new_session is fine), then GetSession triggers list_sessions.
+        let create_resp = send_request(
+            &mut stream,
+            &serde_json::json!({
+                "op": "CreateSession",
+                "uuid": "err-get-uuid",
+                "shortname": "s",
+                "repo_slug": "r",
+                "branch": "main",
+                "workdir_parent": "/tmp",
+                "repo_leaf": "r"
+            }),
+        )
+        .await;
+        assert!(create_resp.get("error").is_none(), "create must succeed: {create_resp}");
+
+        let get = send_request(
+            &mut stream,
+            &serde_json::json!({"op": "GetSession", "uuid": "err-get-uuid"}),
+        )
+        .await;
+        assert_eq!(get["error"], "tmux_error", "list_sessions error must propagate via GetSession: {get}");
+    }
+
+    // ── ListSessions multiple sessions ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn list_sessions_multiple_with_mixed_status() {
+        // Two sessions in ownership map; one is live in tmux, one is dead.
+        let mock = MockTmuxOps::new()
+            .with_live_sessions(vec![make_tmux_session("mux-alive")]);
+        let addr = start_mock_server(mock).await;
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+
+        send_request(
+            &mut stream,
+            &serde_json::json!({
+                "op": "CreateSession",
+                "uuid": "uuid-alive",
+                "shortname": "alive",
+                "repo_slug": "r",
+                "branch": "main",
+                "workdir_parent": "/tmp",
+                "repo_leaf": "r"
+            }),
+        )
+        .await;
+        send_request(
+            &mut stream,
+            &serde_json::json!({
+                "op": "CreateSession",
+                "uuid": "uuid-dead",
+                "shortname": "dead",
+                "repo_slug": "r",
+                "branch": "main",
+                "workdir_parent": "/tmp",
+                "repo_leaf": "r2"
+            }),
+        )
+        .await;
+
+        let resp = send_request(&mut stream, &serde_json::json!({"op": "ListSessions"})).await;
+        let sessions = resp["sessions"].as_array().expect("sessions array");
+        assert_eq!(sessions.len(), 2, "both sessions must appear");
+
+        let alive = sessions.iter().find(|s| s["uuid"] == "uuid-alive").expect("alive entry");
+        let dead = sessions.iter().find(|s| s["uuid"] == "uuid-dead").expect("dead entry");
+        assert_eq!(alive["status"], "active", "mux-alive is in the live list");
+        assert_eq!(dead["status"], "dead", "mux-dead is not in the live list");
     }
 }
