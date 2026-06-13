@@ -1156,4 +1156,82 @@ mod tests {
     fn parse_lock_tcp_url_empty_returns_none() {
         assert_eq!(parse_lock_tcp_url(r#"{"pid":1,"tcp_url":""}"#), None);
     }
+
+    // ── select_agent_binary ───────────────────────────────────────────────────
+    //
+    // These tests mutate MUX_AGENT_BINARY and must not run concurrently with
+    // other tests that do the same. Serialized via ENV_MUTEX.
+
+    static ENV_MUTEX: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        let m = ENV_MUTEX.get_or_init(|| std::sync::Mutex::new(()));
+        m.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn select_agent_binary_env_var_existing_path_succeeds() {
+        let _lock = env_lock();
+        let dir = TempDir::new().unwrap();
+        let bin_path = dir.path().join("mux-agent-custom");
+        std::fs::write(&bin_path, b"fake").unwrap();
+        std::env::set_var("MUX_AGENT_BINARY", bin_path.to_str().unwrap());
+        let _guard = EnvGuard("MUX_AGENT_BINARY");
+
+        let (path, _version) = select_agent_binary("amd64").unwrap();
+        assert_eq!(path, bin_path, "should return the path set in MUX_AGENT_BINARY");
+    }
+
+    #[test]
+    fn select_agent_binary_env_var_nonexistent_path_errors() {
+        let _lock = env_lock();
+        std::env::set_var("MUX_AGENT_BINARY", "/nonexistent/mux-agent");
+        let _guard = EnvGuard("MUX_AGENT_BINARY");
+
+        let err = select_agent_binary("amd64").unwrap_err();
+        assert!(
+            err.to_string().contains("MUX_AGENT_BINARY"),
+            "error should mention MUX_AGENT_BINARY, got: {err}"
+        );
+    }
+
+    #[test]
+    fn select_agent_binary_empty_env_var_falls_through_to_adjacent_lookup() {
+        let _lock = env_lock();
+        // Empty string: treated as "not set" — falls through to adjacent-exe lookup.
+        std::env::set_var("MUX_AGENT_BINARY", "");
+        let _guard = EnvGuard("MUX_AGENT_BINARY");
+
+        // Adjacent binary won't exist (test runner is not mux), so we get the
+        // "no agent binary found" error from the adjacent lookup — not a
+        // "path does not exist" error from the MUX_AGENT_BINARY branch.
+        let err = select_agent_binary("amd64").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no agent binary found"),
+            "empty MUX_AGENT_BINARY should fall through to adjacent lookup error, got: {msg}"
+        );
+        assert!(
+            !msg.contains("does not exist"),
+            "empty MUX_AGENT_BINARY should not hit the MUX_AGENT_BINARY path, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn select_agent_binary_unset_env_var_reports_helpful_error() {
+        let _lock = env_lock();
+        std::env::remove_var("MUX_AGENT_BINARY");
+
+        // Adjacent binary won't exist (test runner is not mux), so we get an error
+        // telling the user to set MUX_AGENT_BINARY.
+        let err = select_agent_binary("amd64").unwrap_err();
+        assert!(
+            err.to_string().contains("MUX_AGENT_BINARY"),
+            "error should hint at MUX_AGENT_BINARY, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("amd64"),
+            "error should include the arch, got: {err}"
+        );
+    }
 }
