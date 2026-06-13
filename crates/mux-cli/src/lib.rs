@@ -4,6 +4,7 @@ use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::generate;
 
+pub mod agent;
 pub mod agent_start;
 pub mod attach;
 pub mod create;
@@ -113,11 +114,20 @@ pub enum HostAction {
 #[derive(Debug, Subcommand)]
 pub enum AgentAction {
     /// Deploy the agent binary to a host
-    Deploy,
+    Deploy {
+        /// Host alias to deploy to
+        alias: String,
+    },
     /// Stream agent logs
-    Logs,
+    Logs {
+        /// Host alias
+        alias: String,
+    },
     /// Stop the agent on a host
-    Stop,
+    Stop {
+        /// Host alias
+        alias: String,
+    },
 }
 
 pub async fn run(command: Command, mux_home: PathBuf) -> Result<()> {
@@ -138,7 +148,23 @@ pub async fn run(command: Command, mux_home: PathBuf) -> Result<()> {
             let store = mux_state::store::Store::open(&db_path)?;
             crate::host::run_host(action, store.conn()).await
         }
-        Command::Agent { .. } => todo!("mux agent"),
+        Command::Agent { action } => {
+            let db_path = mux_home.join("mux.db");
+            let store = mux_state::store::Store::open(&db_path)?;
+            match action {
+                AgentAction::Deploy { alias } => {
+                    // Real SSH execution not yet wired (no production SSH executor).
+                    // The core logic (run_agent_deploy) is tested in isolation via
+                    // MockDeployHost; wire up once a real SshHost impl lands.
+                    let _ = alias;
+                    anyhow::bail!("mux agent deploy: SSH execution not yet implemented")
+                }
+                AgentAction::Logs { alias } | AgentAction::Stop { alias } => {
+                    let _ = (store, alias);
+                    anyhow::bail!("mux agent: SSH execution not yet implemented")
+                }
+            }
+        }
         // TODO: wire to run_create once a real SshHost SSH impl lands (currently
         // no production SSH executor exists; the create module is tested in isolation).
         Command::Create { .. } => anyhow::bail!("mux create: SSH execution not yet implemented"),
