@@ -12,6 +12,16 @@ use mux_state::model::Session;
 use crate::agent_start::{AgentStarter, RemoteExec};
 use crate::kill::resolve_session;
 
+// ── Internal types ────────────────────────────────────────────────────────────
+
+enum LiveResult {
+    Live(mux_rpc::schema::GetSessionResponse),
+    AgentNotFound,
+    NoAgent,
+    ProbeError(String),
+    HostNotProbed,
+}
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /// Execution context for `mux status`.
@@ -44,31 +54,59 @@ pub async fn run_status<E: RemoteExec>(ctx: StatusContext<'_, E>) -> Result<()> 
         .ok_or_else(|| anyhow::anyhow!("mux: host record missing for session '{}'", ctx.selector))?;
 
     // Step 3 — attempt live GetSession RPC (no TOFU; read-only probe)
-    let home = host.home.as_deref().unwrap_or("/tmp");
-    let starter = AgentStarter::new(home, ctx.ssh);
-    let live_data = match starter.probe_existing() {
-        Ok(Some(agent_urls)) => {
-            let rpc = RpcClient::tcp("127.0.0.1", agent_urls.tcp_port());
-            match rpc.get_session(GetSessionRequest { uuid: session.uuid.clone() }).await {
-                Ok(resp) => Some(resp),
-                Err(MuxError::AgentError(ref msg)) if msg.starts_with("not_found") => {
-                    // Session unknown to agent — fall through to local display
-                    None
+    //
+    // host.home must have been set by `mux host test`; without it we cannot
+    // know where agent.lock lives, so skip the live probe and fall back to
+    // local data with a note.
+    let live_result = if let Some(home) = host.home.as_deref() {
+        let starter = AgentStarter::new(home, ctx.ssh);
+        match starter.probe_existing() {
+            Ok(Some(agent_urls)) => {
+                let rpc = RpcClient::tcp("127.0.0.1", agent_urls.tcp_port());
+                match rpc.get_session(GetSessionRequest { uuid: session.uuid.clone() }).await {
+                    Ok(resp) => LiveResult::Live(resp),
+                    Err(MuxError::AgentError(ref msg)) if msg.starts_with("not_found") => {
+                        // Agent is running but does not own this session — possible drift.
+                        LiveResult::AgentNotFound
+                    }
+                    Err(e) => return Err(anyhow::anyhow!("{e}")),
                 }
-                Err(e) => return Err(anyhow::anyhow!("{e}")),
+            }
+            Ok(None) => LiveResult::NoAgent,
+            Err(e) => {
+                // Probe failed (SSH error, corrupt lock, etc.) — show reason in note.
+                LiveResult::ProbeError(e.to_string())
             }
         }
-        Ok(None) | Err(_) => {
-            // No agent running or SSH probe failed — fall back to local data
-            None
-        }
+    } else {
+        LiveResult::HostNotProbed
     };
 
     // Step 4 — display
-    if let Some(live) = live_data {
-        print_session_live(&session, &host.alias, status_to_str(&live.status), &live.tmux_name);
-    } else {
-        print_session_local(&session, &host.alias);
+    match live_result {
+        LiveResult::Live(resp) => {
+            print_session_live(&session, &host.alias, status_to_str(&resp.status), &resp.tmux_name);
+        }
+        LiveResult::AgentNotFound => {
+            print_session_local(
+                &session,
+                &host.alias,
+                "agent reachable but has no record of this session (possibly orphaned)",
+            );
+        }
+        LiveResult::NoAgent => {
+            print_session_local(&session, &host.alias, "agent not running");
+        }
+        LiveResult::ProbeError(ref reason) => {
+            print_session_local(
+                &session,
+                &host.alias,
+                &format!("could not probe agent: {reason}"),
+            );
+        }
+        LiveResult::HostNotProbed => {
+            print_session_local(&session, &host.alias, "host not yet probed (run 'mux host test')");
+        }
     }
 
     Ok(())
@@ -96,7 +134,7 @@ fn print_session_live(session: &Session, host_alias: &str, live_status: &str, li
     println!("repo:      {}", session.repo_slug);
 }
 
-fn print_session_local(session: &Session, host_alias: &str) {
+fn print_session_local(session: &Session, host_alias: &str, note: &str) {
     println!("uuid:      {}", session.uuid);
     println!("shortname: {}", session.shortname);
     println!("host:      {}", host_alias);
@@ -109,7 +147,7 @@ fn print_session_local(session: &Session, host_alias: &str) {
     }
     println!("branch:    {}", session.branch);
     println!("repo:      {}", session.repo_slug);
-    println!("note:      using local data (host unreachable or agent not running)");
+    println!("note:      {}", note);
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -306,5 +344,108 @@ mod tests {
             .unwrap();
         let s = session_repo::get_by_uuid(conn, uuid).unwrap().unwrap();
         assert_eq!(s.status, "unreachable", "status must not be mutated");
+    }
+
+    // ── status_to_str unit tests ──────────────────────────────────────────────
+
+    #[test]
+    fn status_to_str_all_variants() {
+        use mux_rpc::schema::SessionStatusValue;
+        assert_eq!(status_to_str(&SessionStatusValue::Active), "active");
+        assert_eq!(status_to_str(&SessionStatusValue::Dead), "dead");
+        assert_eq!(status_to_str(&SessionStatusValue::Unreachable), "unreachable");
+        assert_eq!(status_to_str(&SessionStatusValue::Orphaned), "orphaned");
+    }
+
+    // ── live-path TCP loopback tests ──────────────────────────────────────────
+
+    use mux_rpc::schema::{GetSessionResponse, RpcError, RpcResult, SessionStatusValue};
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
+    fn encode_get_session_response(resp: GetSessionResponse) -> Vec<u8> {
+        let result: RpcResult<GetSessionResponse> = RpcResult::Ok(resp);
+        let body = mux_rpc::codec::encode(&result).unwrap();
+        let mut frame = Vec::with_capacity(4 + body.len());
+        frame.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        frame.extend_from_slice(&body);
+        frame
+    }
+
+    fn encode_rpc_error_for_get(err: RpcError) -> Vec<u8> {
+        let result: RpcResult<GetSessionResponse> = RpcResult::Err(err);
+        let body = mux_rpc::codec::encode(&result).unwrap();
+        let mut frame = Vec::with_capacity(4 + body.len());
+        frame.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        frame.extend_from_slice(&body);
+        frame
+    }
+
+    async fn spawn_status_server(response_frame: Vec<u8>) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                use tokio::io::AsyncReadExt;
+                let mut len_buf = [0u8; 4];
+                if stream.read_exact(&mut len_buf).await.is_ok() {
+                    let body_len = u32::from_le_bytes(len_buf) as usize;
+                    let mut body = vec![0u8; body_len];
+                    let _ = stream.read_exact(&mut body).await;
+                }
+                let _ = stream.write_all(&response_frame).await;
+            }
+        });
+        port
+    }
+
+    fn lock_json(port: u16) -> String {
+        format!(r#"{{"pid":99999,"tcp_url":"tcp://127.0.0.1:{port}"}}"#)
+    }
+
+    fn agent_running_responses(port: u16) -> Vec<(i32, String, String)> {
+        vec![(0, lock_json(port), String::new()), (0, String::new(), String::new())]
+    }
+
+    #[tokio::test]
+    async fn status_live_path_displays_rpc_data() {
+        let (_dir, store) = open_store();
+        let conn = store.conn();
+        let host_id = insert_host(conn);
+        let uuid = "ffffffff-ffff-ffff-ffff-ffffffffffff";
+        insert_active_session(conn, host_id, uuid, "liveapp");
+
+        let response = GetSessionResponse {
+            uuid: uuid.to_owned(),
+            shortname: "liveapp".to_owned(),
+            tmux_name: "mux-liveapp".to_owned(),
+            status: SessionStatusValue::Active,
+        };
+        let port = spawn_status_server(encode_get_session_response(response)).await;
+        let ssh = MockRemoteExec::new(agent_running_responses(port));
+
+        // Should succeed and print live data (no panic = success)
+        run_status(make_ctx(conn, ssh, uuid)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn status_live_not_found_shows_local_data() {
+        let (_dir, store) = open_store();
+        let conn = store.conn();
+        let host_id = insert_host(conn);
+        let uuid = "11111111-1111-1111-1111-111111111111";
+        insert_active_session(conn, host_id, uuid, "orphanedapp");
+
+        let port = spawn_status_server(encode_rpc_error_for_get(RpcError::not_found(
+            "not_found: no such session",
+        )))
+        .await;
+        let ssh = MockRemoteExec::new(agent_running_responses(port));
+
+        // not_found → AgentNotFound branch → falls back to local data, no error
+        run_status(make_ctx(conn, ssh, uuid)).await.unwrap();
+        // No mutation
+        let s = session_repo::get_by_uuid(conn, uuid).unwrap().unwrap();
+        assert_eq!(s.status, "active", "status must not be mutated on not_found");
     }
 }
