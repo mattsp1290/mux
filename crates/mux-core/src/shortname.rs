@@ -13,17 +13,51 @@
 /// Maximum byte length of a stored shortname (without the `mux-` tmux prefix).
 pub const MAX_SHORTNAME_BYTES: usize = 124;
 
+/// Fallback shortname used when both repo-leaf and branch sanitize to empty.
+const FALLBACK_SHORTNAME: &str = "session";
+
+/// Largest byte index `<= max` that is a valid UTF-8 char boundary in `s`.
+///
+/// Used before fixed-byte slices to avoid panicking on multibyte input.
+fn floor_boundary(s: &str, max: usize) -> usize {
+    if max >= s.len() {
+        return s.len();
+    }
+    let mut idx = max;
+    while idx > 0 && !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
+/// Truncate `s` to at most `max` bytes, preferring a hyphen boundary.
+///
+/// Internal helper shared by [`truncate_shortname`] and [`shortname_with_suffix`].
+fn truncate_to(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_owned();
+    }
+    let cut = floor_boundary(s, max);
+    let prefix = &s[..cut];
+    match prefix.rfind('-') {
+        Some(pos) if pos > 0 => prefix[..pos].to_owned(),
+        _ => prefix.to_owned(),
+    }
+}
+
 /// Sanitize a component (repo leaf or branch name) for use in a shortname.
 ///
-/// Rules: lowercase, replace any non-`[a-z0-9]` character with `-`, collapse
+/// Rules: lowercase, replace any non-ASCII-alphanumeric character with `-`, collapse
 /// consecutive hyphens, strip leading and trailing hyphens.
+///
+/// Post-condition: output contains only `[a-z0-9-]`, has no leading/trailing hyphen,
+/// and has no consecutive hyphens.
 pub fn sanitize_component(s: &str) -> String {
     let mut out = String::new();
     let mut prev_hyphen = false;
     for c in s.chars() {
-        let c_lower = c.to_ascii_lowercase();
-        if c_lower.is_ascii_alphanumeric() {
-            out.push(c_lower);
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
             prev_hyphen = false;
         } else if !prev_hyphen {
             out.push('-');
@@ -36,16 +70,12 @@ pub fn sanitize_component(s: &str) -> String {
 /// Truncate a shortname to [`MAX_SHORTNAME_BYTES`] bytes.
 ///
 /// Prefers truncating at a hyphen boundary. If no hyphen exists within the first
-/// 124 bytes, hard-truncates at 124 bytes.
+/// 124 bytes, hard-truncates at 124 bytes. Safe for arbitrary UTF-8 input.
+///
+/// Note: this function only enforces length — it does not strip leading/trailing hyphens
+/// or validate character content. Call [`sanitize_component`] first for clean output.
 pub fn truncate_shortname(s: &str) -> String {
-    if s.len() <= MAX_SHORTNAME_BYTES {
-        return s.to_owned();
-    }
-    let prefix = &s[..MAX_SHORTNAME_BYTES];
-    match prefix.rfind('-') {
-        Some(pos) if pos > 0 => prefix[..pos].to_owned(),
-        _ => prefix.to_owned(),
-    }
+    truncate_to(s, MAX_SHORTNAME_BYTES)
 }
 
 /// Generate a deterministic shortname for a non-main branch.
@@ -53,12 +83,13 @@ pub fn truncate_shortname(s: &str) -> String {
 /// Format: `{sanitized_repo_leaf}-{sanitized_branch}` truncated to 124 bytes.
 ///
 /// Same `repo_leaf` + `branch` input always produces the same output (stable).
-/// Collision with existing shortnames is resolved by the caller (append `-2`, `-3`, etc.).
+/// Collision with existing shortnames is resolved by the caller via
+/// [`shortname_with_suffix`] (append `-2`, `-3`, etc.).
 pub fn shortname_for_branch(repo_leaf: &str, branch: &str) -> String {
     let leaf = sanitize_component(repo_leaf);
     let branch_s = sanitize_component(branch);
     if leaf.is_empty() && branch_s.is_empty() {
-        return truncate_shortname("session");
+        return FALLBACK_SHORTNAME.to_owned();
     }
     let combined = if leaf.is_empty() {
         branch_s
@@ -74,9 +105,10 @@ pub fn shortname_for_branch(repo_leaf: &str, branch: &str) -> String {
 ///
 /// Format: `{sanitized_repo_leaf}-{adjective}-{noun}` truncated to 124 bytes.
 ///
-/// The caller is responsible for selecting the adjective+noun pair (typically from
-/// [`ADJECTIVES`] and [`NOUNS`]) and iterating until no collision exists in the session
-/// store.
+/// The caller is responsible for selecting the adjective+noun pair (typically by
+/// iterating all pairs from [`ADJECTIVES`] × [`NOUNS`], in random order, until one
+/// produces a shortname that is not already present in the session store).
+/// [`main_namespace_size`] gives the total number of available pairs.
 pub fn shortname_for_main(repo_leaf: &str, adjective: &str, noun: &str) -> String {
     let leaf = sanitize_component(repo_leaf);
     let adj = sanitize_component(adjective);
@@ -85,7 +117,7 @@ pub fn shortname_for_main(repo_leaf: &str, adjective: &str, noun: &str) -> Strin
         (false, false, false) => format!("{leaf}-{adj}-{noun_s}"),
         (true, false, false) => format!("{adj}-{noun_s}"),
         (false, _, _) => leaf,
-        _ => "session".to_owned(),
+        _ => FALLBACK_SHORTNAME.to_owned(),
     };
     truncate_shortname(&combined)
 }
@@ -97,23 +129,39 @@ pub fn tmux_session_name(shortname: &str) -> String {
 
 /// Suffix a shortname with a collision counter: `-2`, `-3`, etc.
 ///
-/// The first shortname (no suffix) is attempt 1. This function returns suffixed
-/// versions for attempts 2 and above.
+/// `attempt` is **1-based**: attempt 1 returns the base unchanged (no suffix);
+/// attempt 2 appends `-2`, attempt 3 appends `-3`, and so on.
+/// Passing 0 is a programming error and panics in debug builds.
 ///
-/// Truncation is applied after appending the suffix to keep the result within 124 bytes.
+/// The result is truncated to [`MAX_SHORTNAME_BYTES`] at a hyphen boundary where
+/// possible — the same rule as [`truncate_shortname`] — so the output always fits in
+/// the byte budget.
+///
+/// Note: two very long bases that share a common prefix may truncate to the same
+/// suffixed name. The caller is responsible for verifying uniqueness in the session
+/// store after applying the suffix.
 pub fn shortname_with_suffix(base: &str, attempt: u32) -> String {
+    debug_assert!(
+        attempt >= 1,
+        "shortname_with_suffix: attempt is 1-based, got 0"
+    );
     if attempt <= 1 {
         return base.to_owned();
     }
     let suffix = format!("-{attempt}");
     let available = MAX_SHORTNAME_BYTES.saturating_sub(suffix.len());
-    let trimmed_base = if base.len() > available {
-        &base[..available]
-    } else {
-        base
-    };
-    let trimmed_base = trimmed_base.trim_end_matches('-');
-    format!("{trimmed_base}{suffix}")
+    let trimmed = truncate_to(base, available);
+    let trimmed = trimmed.trim_end_matches('-');
+    format!("{trimmed}{suffix}")
+}
+
+/// Total number of distinct adjective-noun pairs in the word lists.
+///
+/// A caller iterating pairs to find a unique main-branch shortname can use this to
+/// detect exhaustion of the namespace (all `ADJECTIVES.len() × NOUNS.len()` pairs
+/// have been tried).
+pub fn main_namespace_size() -> usize {
+    ADJECTIVES.len() * NOUNS.len()
 }
 
 /// Adjectives used for main-branch shortname generation.
@@ -185,7 +233,7 @@ mod tests {
 
     #[test]
     fn truncate_at_hyphen_boundary() {
-        // Build a string that is 125 bytes: "aaa...a-bbb...b", truncate should find last hyphen before byte 124
+        // 125 bytes: "aaa...a-bbb...b"; truncate should cut at the hyphen at byte 60
         let base = "a".repeat(60) + "-" + &"b".repeat(64);
         assert_eq!(base.len(), 125);
         let result = truncate_shortname(&base);
@@ -208,6 +256,15 @@ mod tests {
         assert_eq!(truncate_shortname(&s).len(), MAX_SHORTNAME_BYTES);
     }
 
+    #[test]
+    fn truncate_multibyte_does_not_panic() {
+        // 'é' is 2 bytes; 123×'a' + 'é' = 125 bytes, byte 124 is mid-'é'
+        let s = "a".repeat(123) + "é";
+        assert_eq!(s.len(), 125);
+        let result = truncate_shortname(&s);
+        assert!(result.len() <= MAX_SHORTNAME_BYTES);
+    }
+
     // shortname_for_branch
 
     #[test]
@@ -228,7 +285,6 @@ mod tests {
 
     #[test]
     fn shortname_for_branch_sanitizes_components() {
-        // underscores → hyphens
         assert_eq!(
             shortname_for_branch("my_repo", "my_branch"),
             "my-repo-my-branch"
@@ -241,6 +297,21 @@ mod tests {
         let branch = "b".repeat(100);
         let result = shortname_for_branch(&repo, &branch);
         assert!(result.len() <= MAX_SHORTNAME_BYTES);
+    }
+
+    #[test]
+    fn shortname_for_branch_empty_leaf_uses_branch() {
+        assert_eq!(shortname_for_branch("///", "feature/x"), "feature-x");
+    }
+
+    #[test]
+    fn shortname_for_branch_empty_branch_uses_leaf() {
+        assert_eq!(shortname_for_branch("myrepo", "///"), "myrepo");
+    }
+
+    #[test]
+    fn shortname_for_branch_both_empty_is_fallback() {
+        assert_eq!(shortname_for_branch("///", "---"), FALLBACK_SHORTNAME);
     }
 
     // shortname_for_main
@@ -263,7 +334,6 @@ mod tests {
 
     #[test]
     fn shortname_for_main_no_main_master_suffix() {
-        // main/master do NOT appear in the generated name — only repo leaf and adj-noun
         let result = shortname_for_main("mux", "calm", "fox");
         assert!(!result.contains("main"));
         assert!(!result.contains("master"));
@@ -286,6 +356,12 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "attempt is 1-based, got 0")]
+    fn shortname_with_suffix_attempt_0_panics_in_debug() {
+        shortname_with_suffix("my-session", 0);
+    }
+
+    #[test]
     fn shortname_with_suffix_appends_counter() {
         assert_eq!(shortname_with_suffix("my-session", 2), "my-session-2");
         assert_eq!(shortname_with_suffix("my-session", 10), "my-session-10");
@@ -294,6 +370,16 @@ mod tests {
     #[test]
     fn shortname_with_suffix_stays_within_124() {
         let base = "a".repeat(MAX_SHORTNAME_BYTES);
+        let result = shortname_with_suffix(&base, 2);
+        assert!(result.len() <= MAX_SHORTNAME_BYTES);
+        assert!(result.ends_with("-2"));
+    }
+
+    #[test]
+    fn shortname_with_suffix_multibyte_does_not_panic() {
+        // 121×'a' + 'é' = 123 bytes; available for "-2" is 122, which splits 'é'
+        let base = "a".repeat(121) + "é";
+        assert_eq!(base.len(), 123);
         let result = shortname_with_suffix(&base, 2);
         assert!(result.len() <= MAX_SHORTNAME_BYTES);
         assert!(result.ends_with("-2"));
@@ -319,5 +405,15 @@ mod tests {
         for &noun in NOUNS {
             assert_eq!(sanitize_component(noun), noun, "noun {noun:?} is not clean");
         }
+    }
+
+    #[test]
+    fn main_namespace_size_is_product_of_lists() {
+        assert_eq!(
+            main_namespace_size(),
+            ADJECTIVES.len() * NOUNS.len(),
+            "namespace size should be 20×20"
+        );
+        assert_eq!(main_namespace_size(), 400);
     }
 }
