@@ -58,7 +58,7 @@ pub fn select_agent_binary(arch: &str) -> Result<(std::path::PathBuf, String)> {
 
     if !path.exists() {
         bail!(
-            "no agent binary found for arch '{arch}'; \
+            "no agent binary found adjacent to mux (expected '{binary_name}'); \
              set MUX_AGENT_BINARY to the path of the mux-agent binary"
         );
     }
@@ -1170,6 +1170,11 @@ mod tests {
     }
 
     // ── select_agent_binary ───────────────────────────────────────────────────
+    //
+    // The adjacent-binary success path (current_exe() + "mux-agent-{arch}") is not
+    // unit-testable: current_exe() resolves to the test runner binary, not mux.
+    // That path is covered by integration tests (mux-zpx). Unit tests here cover
+    // the MUX_AGENT_BINARY env-var path and the adjacent-lookup error paths.
 
     #[test]
     fn select_agent_binary_env_var_existing_path_succeeds() {
@@ -1225,15 +1230,88 @@ mod tests {
         std::env::remove_var("MUX_AGENT_BINARY");
 
         // Adjacent binary won't exist (test runner is not mux), so we get an error
-        // telling the user to set MUX_AGENT_BINARY.
+        // naming the expected binary and telling the user to set MUX_AGENT_BINARY.
         let err = select_agent_binary("amd64").unwrap_err();
-        assert!(
-            err.to_string().contains("MUX_AGENT_BINARY"),
-            "error should hint at MUX_AGENT_BINARY, got: {err}"
+        let msg = err.to_string();
+        assert!(msg.contains("MUX_AGENT_BINARY"), "error should hint at MUX_AGENT_BINARY, got: {err}");
+        assert!(msg.contains("mux-agent-amd64"), "error should name the expected binary, got: {err}");
+    }
+
+    #[test]
+    fn select_agent_binary_arm64_not_found_names_expected_binary() {
+        let _lock = env_lock();
+        std::env::remove_var("MUX_AGENT_BINARY");
+
+        let err = select_agent_binary("arm64").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("mux-agent-arm64"), "error should name mux-agent-arm64, got: {err}");
+        assert!(msg.contains("MUX_AGENT_BINARY"), "error should hint at env var, got: {err}");
+    }
+
+    #[test]
+    fn detect_version_falls_back_to_package_version_for_non_executable() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("fake-mux-agent");
+        std::fs::write(&path, b"not-a-real-binary").unwrap();
+        // Explicitly remove the execute bit so Command::output() returns Err(EACCES),
+        // not just a non-ELF format error, making the precondition unambiguous.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let version = detect_version(&path);
+        assert_eq!(
+            version,
+            env!("CARGO_PKG_VERSION"),
+            "detect_version should fall back to CARGO_PKG_VERSION for non-executable"
         );
-        assert!(
-            err.to_string().contains("amd64"),
-            "error should include the arch, got: {err}"
+    }
+
+    #[test]
+    fn is_local_arch_normalised_mux_names_match_uname_names() {
+        // Verify that the mux arch names (amd64, arm64) are accepted as equivalent
+        // to the uname names (x86_64, aarch64) by is_local_arch.
+        // Run the subset of assertions relevant to the current machine's architecture.
+        let local = std::env::consts::ARCH;
+        match local {
+            "x86_64" => {
+                assert!(is_local_arch("amd64"), "amd64 should be local on x86_64");
+                assert!(is_local_arch("x86_64"), "x86_64 should be local on x86_64");
+                assert!(!is_local_arch("arm64"), "arm64 should not be local on x86_64");
+                assert!(!is_local_arch("aarch64"), "aarch64 should not be local on x86_64");
+            }
+            "aarch64" => {
+                assert!(is_local_arch("arm64"), "arm64 should be local on aarch64");
+                assert!(is_local_arch("aarch64"), "aarch64 should be local on aarch64");
+                assert!(!is_local_arch("amd64"), "amd64 should not be local on aarch64");
+                assert!(!is_local_arch("x86_64"), "x86_64 should not be local on aarch64");
+            }
+            _ => {
+                // Unknown host arch (e.g. RISC-V): verify neither mux arch is local
+                // and the function doesn't panic.
+                assert!(!is_local_arch("amd64"), "amd64 should not match {local}");
+                assert!(!is_local_arch("arm64"), "arm64 should not match {local}");
+            }
+        }
+    }
+
+    #[test]
+    fn version_for_arch_cross_arch_uses_package_version() {
+        // version_for_arch skips binary execution for non-local arches and returns
+        // CARGO_PKG_VERSION directly. The binary content is irrelevant — the
+        // is_local_arch check short-circuits before any Command::output() call.
+        let dir = TempDir::new().unwrap();
+        let fake_path = dir.path().join("mux-agent-fake");
+        std::fs::write(&fake_path, b"cross-arch-binary").unwrap();
+
+        // Pick an arch that is NOT the local machine's arch.
+        let cross_arch = if std::env::consts::ARCH == "x86_64" { "arm64" } else { "amd64" };
+        let version = version_for_arch(&fake_path, cross_arch);
+        assert_eq!(
+            version,
+            env!("CARGO_PKG_VERSION"),
+            "cross-arch deploy should use CARGO_PKG_VERSION, not attempt binary execution"
         );
     }
 }
