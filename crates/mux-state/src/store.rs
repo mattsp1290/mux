@@ -194,4 +194,41 @@ mod tests {
             .unwrap();
         assert_eq!(mode, "wal", "journal_mode should be WAL");
     }
+
+    // ── concurrent open ───────────────────────────────────────────────────────
+
+    #[test]
+    fn two_connections_to_same_db_both_succeed() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("mux.db");
+        let store1 = Store::open(&db_path).unwrap();
+        let store2 = Store::open(&db_path).unwrap();
+        // WAL mode allows concurrent readers; both connections can query.
+        let n1: i64 = store1
+            .conn()
+            .query_row("SELECT COUNT(*) FROM hosts", [], |r| r.get(0))
+            .unwrap();
+        let n2: i64 = store2
+            .conn()
+            .query_row("SELECT COUNT(*) FROM hosts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n1, 0);
+        assert_eq!(n2, 0);
+    }
+
+    #[test]
+    fn write_on_first_connection_visible_on_second() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("mux.db");
+        let store1 = Store::open(&db_path).unwrap();
+        let store2 = Store::open(&db_path).unwrap();
+        crate::host_repo::insert(store1.conn(), "concurrent-host", "u", "1.2.3.4", 22, 1_000_000)
+            .unwrap();
+        // Committed writes by store1 are visible to store2's next read transaction.
+        let n: i64 = store2
+            .conn()
+            .query_row("SELECT COUNT(*) FROM hosts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "write on store1 should be visible via store2");
+    }
 }
