@@ -22,10 +22,14 @@ Rejected: `owner/repo.git` shorthand (ambiguous `.git` suffix).
 Normalisation steps:
 1. Strip trailing `.git` from the path component.
 2. Extract `owner` and `repo` from the path.
-3. Produce a stable `storage_slug`: `{owner}-{repo}` (lowercase, hyphens for non-alnum).
-4. Clone URL: `git@{host}:{owner}/{repo}.git`.
-5. Repo leaf: the `repo` component.
-6. Owner/repo split is stored; never re-derived from the clone URL.
+3. Produce `repo_slug`: `{owner}/{repo}` (forward-slash canonical form, lowercase).
+   This is the authoritative owner/repo identifier used in all storage, RPC, and
+   kill-ownership comparisons.
+4. Produce `storage_slug`: `{owner}-{repo}` (lowercase, hyphens for non-alnum).
+   Used only for filesystem paths where `/` is invalid.
+5. Clone URL: `git@{host}:{owner}/{repo}.git`.
+6. Repo leaf: the `repo` component.
+7. Owner/repo split is stored; never re-derived from the clone URL.
 
 ## Shortname sanitisation
 
@@ -56,7 +60,8 @@ Format: `{repo-leaf}-{sanitised-branch}`.
 ## Workdir safety
 
 A session workdir is considered **mux-created** (and therefore removable) only if:
-- Path matches `<home>/.mux/<uuid>/<repo-leaf>`.
+- Path matches `$MUX_HOME/<uuid>/<repo-leaf>` (where `$MUX_HOME` is the resolved
+  state directory — `MUX_HOME` env var, or `~/.mux` by default).
 - No symlinks in the path.
 
 Workdirs not matching this pattern (imported sessions) must never be removed.

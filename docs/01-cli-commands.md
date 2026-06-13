@@ -7,7 +7,7 @@
 - Home-directory failure: if `MUX_HOME` is unset and the home directory cannot be
   determined, every command exits with a human-readable error prefixed `mux: `.
 - Error prefix: all user-facing errors are prefixed `mux: `.
-- Exit codes: 0 = success, 1 = user error, 2 = internal/unexpected error.
+- Exit codes: 0 = success, 1 = user/host/remote error, 2 = internal/unexpected error.
 
 ## `mux init`
 
@@ -131,7 +131,8 @@ Kill a session.
 - Fingerprint mismatch: refuses operation.
 - Gets ownership via `repo_slug`.
 - Sends `KillSession` RPC; agent removes workdir and kills tmux session.
-- No-op (leaves state unchanged) on non-owned or already-dead sessions.
+- No-op on already-dead sessions: exits 0 with message `mux: session already dead`.
+- No-op on non-owned sessions: exits 1 with message `mux: session not owned by this client`.
 - Marks session dead locally only after `tmux_killed` or `workdir_removed` effect.
 
 ## `mux completions <shell>`

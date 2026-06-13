@@ -72,10 +72,12 @@ CREATE TABLE sessions (
     uuid            TEXT    NOT NULL UNIQUE,
     host_id         INTEGER NOT NULL REFERENCES hosts(id) ON DELETE CASCADE,
     shortname       TEXT    NOT NULL,
-    tmux_name       TEXT    NOT NULL,      -- includes mux- prefix
-    repo_slug       TEXT    NOT NULL,      -- owner/repo normalised
+    tmux_name       TEXT,                  -- includes mux- prefix; NULL during reservation
+    repo_slug       TEXT    NOT NULL,      -- owner/repo (slash form; see docs/02 §repo_slug)
     branch          TEXT    NOT NULL,
-    workdir         TEXT    NOT NULL,      -- remote absolute path
+    workdir         TEXT,                  -- remote absolute path; NULL for imported rows
+                                           -- where workdir is unknown until first list
+    transport_mode  TEXT,                  -- 'streamlocal' | 'tcp'; NULL until create
     status          TEXT    NOT NULL DEFAULT 'active',  -- see SessionStatus
     imported        INTEGER NOT NULL DEFAULT 0,  -- 1 = not mux-created workdir
     created_at      INTEGER NOT NULL,      -- Unix seconds
@@ -90,13 +92,20 @@ CREATE TABLE sessions (
 | `active` | Session is live and accessible |
 | `dead` | Session confirmed gone (tmux session destroyed) |
 | `unreachable` | Host could not be contacted during last list/status |
-| `orphaned` | tmux session exists but no longer in the mux session map |
+| `orphaned` | tmux session exists with `mux-` prefix but not in the agent's UUID→tmux_name map (set during `mux list` reconciliation) |
 
 ## Reservation semantics
 
-Before any remote operation, a session row is inserted with `status = 'active'` and
-a new UUID. This reserves the UUID and shortname. If the remote operation fails, the
-row is deleted. This prevents partial-create rows from persisting.
+Before any remote operation, a session row is inserted with:
+- `status = 'active'`
+- `tmux_name = NULL` (filled after `CreateSession` RPC completes)
+- `workdir = NULL` (filled after workdir is created)
+- `transport_mode = NULL` (filled after transport probe)
+
+The `tmux_name`, `workdir`, and `transport_mode` fields are updated atomically in step 10
+of the create flow (docs/07). If the remote operation fails, the row is deleted. In-flight
+reservation rows (where `tmux_name IS NULL`) are ignored by `mux list` reconciliation
+(they are not yet real sessions).
 
 ## Timestamps
 

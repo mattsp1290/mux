@@ -53,8 +53,11 @@
 
 ### Transport persistence
 
-- `transport_mode` is stored per host after `host test`.
-- `mux create` persists the chosen transport to the session row.
+- `transport_mode` is stored per host (in the `hosts.transport` column) after `host test`.
+- `mux create` persists the chosen `transport_mode` to the session row
+  (`sessions.transport_mode` column; see docs/03 §Sessions table).
+- On subsequent connects, read `sessions.transport_mode` (not `hosts.transport`) to
+  reproduce the exact channel used at create time.
 
 ### MUX_FORCE_TRANSPORT
 

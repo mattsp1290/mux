@@ -31,8 +31,8 @@ To be decided in mux-2n5. The following operations are required:
 |---|---|---|
 | `Health` | `{}` | `{ ok: bool }` |
 | `CreateSession` | see below | `{ uuid, shortname, tmux_name }` |
-| `ListSessions` | `{}` | `[{ uuid, shortname, tmux_name, status }]` |
-| `GetSession` | `{ shortname }` | `{ uuid, shortname, tmux_name, status }` |
+| `ListSessions` | `{}` | `[{ uuid, shortname, tmux_name, workdir, status }]` |
+| `GetSession` | `{ uuid }` | `{ uuid, shortname, tmux_name, status }` |
 | `KillSession` | `{ uuid, repo_slug }` | `{ tmux_killed, workdir_removed }` |
 | `Shutdown` | `{}` | `{}` |
 | `StreamSessionEvents` | `{}` | unimplemented in v0.1; return UNIMPLEMENTED |
