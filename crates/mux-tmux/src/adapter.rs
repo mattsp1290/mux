@@ -18,9 +18,9 @@ pub enum TmuxError {
     #[error("invalid status string: {0}")]
     InvalidStatusString(String),
 
-    #[error("tmux command '{command}' failed with exit code {exit_code:?}: {stderr}")]
+    #[error("tmux command failed with exit code {exit_code:?}: {stderr}")]
     TmuxFailed {
-        command: String,
+        command: Vec<String>,
         exit_code: Option<i32>,
         stderr: String,
     },
@@ -112,14 +112,22 @@ impl TmuxAdapter {
     /// List all mux-managed tmux sessions (those with the `mux-` prefix).
     ///
     /// Runs: `tmux list-sessions -F '#{session_name}\t#{session_created}\t#{session_activity}'`
+    ///
+    /// Returns `Ok(vec![])` when no sessions exist (tmux exits 1 with "no server running"
+    /// or "no sessions").
     pub async fn list_sessions(&self) -> Result<Vec<SessionInfo>, TmuxError> {
-        let output = self
+        let output = match self
             .run_tmux(&[
                 "list-sessions",
                 "-F",
                 "#{session_name}\t#{session_created}\t#{session_activity}",
             ])
-            .await?;
+            .await
+        {
+            Ok(out) => out,
+            Err(e) if is_no_sessions_error(&e) => return Ok(vec![]),
+            Err(e) => return Err(e),
+        };
         Ok(parse_list_output(&output))
     }
 
@@ -137,7 +145,10 @@ impl TmuxAdapter {
         if output.status.success() {
             Ok(String::from_utf8_lossy(&output.stdout).into_owned())
         } else {
-            let command = format!("{} {}", self.tmux_bin, args.join(" "));
+            let command = std::iter::once(self.tmux_bin.as_str())
+                .chain(args.iter().copied())
+                .map(str::to_owned)
+                .collect();
             let exit_code = output.status.code();
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
             Err(TmuxError::TmuxFailed {
@@ -153,8 +164,8 @@ impl TmuxAdapter {
 
 /// Parse the output of `tmux list-sessions -F '#{session_name}\t#{session_created}\t#{session_activity}'`.
 ///
-/// Exposed as a standalone function so it can be unit-tested without invoking tmux.
-pub fn parse_list_output(output: &str) -> Vec<SessionInfo> {
+/// Exposed as `pub(crate)` so it can be unit-tested without invoking tmux.
+pub(crate) fn parse_list_output(output: &str) -> Vec<SessionInfo> {
     let mut sessions = Vec::new();
     for line in output.lines() {
         // Strip carriage returns (CRLF handling)
@@ -165,9 +176,9 @@ pub fn parse_list_output(output: &str) -> Vec<SessionInfo> {
         let fields: Vec<&str> = line.split('\t').collect();
         if fields.len() != 3 {
             tracing::debug!(
-                "tmux list-sessions: skipping malformed row ({} fields): {:?}",
-                fields.len(),
-                line
+                fields = fields.len(),
+                row = line,
+                "tmux list-sessions: skipping malformed row"
             );
             continue;
         }
@@ -179,20 +190,14 @@ pub fn parse_list_output(output: &str) -> Vec<SessionInfo> {
         let created = match fields[1].parse::<u64>() {
             Ok(v) => v,
             Err(_) => {
-                tracing::debug!(
-                    "tmux list-sessions: skipping row with unparseable created timestamp: {:?}",
-                    line
-                );
+                tracing::debug!(row = line, "tmux list-sessions: skipping row with unparseable created timestamp");
                 continue;
             }
         };
         let activity = match fields[2].parse::<u64>() {
             Ok(v) => v,
             Err(_) => {
-                tracing::debug!(
-                    "tmux list-sessions: skipping row with unparseable activity timestamp: {:?}",
-                    line
-                );
+                tracing::debug!(row = line, "tmux list-sessions: skipping row with unparseable activity timestamp");
                 continue;
             }
         };
@@ -213,9 +218,22 @@ fn validate_session_name(name: &str) -> Result<(), TmuxError> {
             "session name must not be empty".to_owned(),
         ));
     }
-    if !name.starts_with("mux-") {
-        return Err(TmuxError::InvalidSessionName(format!(
+    // Require "mux-" prefix followed by at least one valid character.
+    let suffix = name.strip_prefix("mux-").ok_or_else(|| {
+        TmuxError::InvalidSessionName(format!(
             "session name must start with 'mux-', got: {name:?}"
+        ))
+    })?;
+    if suffix.is_empty() {
+        return Err(TmuxError::InvalidSessionName(
+            "session name must have at least one character after 'mux-'".to_owned(),
+        ));
+    }
+    // Reject chars that tmux uses as target qualifiers or that break parsing:
+    // `.` (window/pane), `:` (window index), and all control chars (break -F framing).
+    if name.chars().any(|c| c == '.' || c == ':' || c.is_control()) {
+        return Err(TmuxError::InvalidSessionName(format!(
+            "session name contains illegal characters (`.`, `:`, or control chars): {name:?}"
         )));
     }
     Ok(())
@@ -232,23 +250,49 @@ fn validate_workdir(workdir: &str) -> Result<(), TmuxError> {
             "workdir must be an absolute path (starts with /), got: {workdir:?}"
         )));
     }
+    // Reject control chars that would corrupt -F row framing.
+    if workdir.chars().any(|c| c.is_control()) {
+        return Err(TmuxError::InvalidWorkdir(format!(
+            "workdir contains control characters: {workdir:?}"
+        )));
+    }
     Ok(())
 }
 
 fn validate_status_string(s: &str) -> Result<(), TmuxError> {
     if !is_valid_status_string(s) {
         return Err(TmuxError::InvalidStatusString(format!(
-            "status string contains shell-special characters: {s:?}"
+            "status string contains forbidden characters: {s:?}"
         )));
     }
     Ok(())
 }
 
-/// Returns true if the status string contains no shell-special characters.
-/// Forbidden: `$`, backtick, `\`, `"`, `'`, `|`, `&`, `;`, `<`, `>`
+/// Returns true if the status string contains no forbidden characters.
+///
+/// Forbidden: `$`, backtick, `\`, `"`, `'`, `|`, `&`, `;`, `<`, `>`, `#`
+/// The `#` is forbidden because tmux interprets `#()` as command execution and
+/// `#{}` as format expansion in status strings.
 fn is_valid_status_string(s: &str) -> bool {
-    const FORBIDDEN: &[char] = &['$', '`', '\\', '"', '\'', '|', '&', ';', '<', '>'];
+    const FORBIDDEN: &[char] = &['$', '`', '\\', '"', '\'', '|', '&', ';', '<', '>', '#'];
     !s.chars().any(|c| FORBIDDEN.contains(&c))
+}
+
+/// Returns true if a `TmuxFailed` error indicates "no sessions/no server",
+/// which tmux signals with exit code 1 and a recognizable stderr message.
+///
+/// tmux versions vary: "no server running", "no sessions", "error connecting to …".
+/// Key on stderr substring rather than exit code alone (tmux uses 1 for real errors too).
+fn is_no_sessions_error(err: &TmuxError) -> bool {
+    match err {
+        TmuxError::TmuxFailed { stderr, .. } => {
+            let s = stderr.to_ascii_lowercase();
+            s.contains("no server running")
+                || s.contains("no sessions")
+                || s.contains("error connecting")
+        }
+        _ => false,
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -264,6 +308,7 @@ mod tests {
         assert!(validate_session_name("mux-my-session").is_ok());
         assert!(validate_session_name("mux-a").is_ok());
         assert!(validate_session_name("mux-123").is_ok());
+        assert!(validate_session_name("mux-abc_def").is_ok());
     }
 
     #[test]
@@ -281,9 +326,34 @@ mod tests {
     }
 
     #[test]
-    fn mux_prefix_alone_is_valid() {
-        // "mux-" with nothing after is technically valid per the spec
-        assert!(validate_session_name("mux-").is_ok());
+    fn bare_mux_prefix_fails() {
+        let err = validate_session_name("mux-").unwrap_err();
+        assert!(matches!(err, TmuxError::InvalidSessionName(_)));
+        assert!(err.to_string().contains("at least one character"));
+    }
+
+    #[test]
+    fn session_name_with_dot_fails() {
+        let err = validate_session_name("mux-a.b").unwrap_err();
+        assert!(matches!(err, TmuxError::InvalidSessionName(_)));
+    }
+
+    #[test]
+    fn session_name_with_colon_fails() {
+        let err = validate_session_name("mux-a:b").unwrap_err();
+        assert!(matches!(err, TmuxError::InvalidSessionName(_)));
+    }
+
+    #[test]
+    fn session_name_with_tab_fails() {
+        let err = validate_session_name("mux-a\tb").unwrap_err();
+        assert!(matches!(err, TmuxError::InvalidSessionName(_)));
+    }
+
+    #[test]
+    fn session_name_with_newline_fails() {
+        let err = validate_session_name("mux-a\nb").unwrap_err();
+        assert!(matches!(err, TmuxError::InvalidSessionName(_)));
     }
 
     // ── Validation: workdir ───────────────────────────────────────────────────
@@ -309,8 +379,13 @@ mod tests {
 
     #[test]
     fn workdir_starting_with_tilde_fails() {
-        // ~ is not an absolute path (doesn't start with /)
         let err = validate_workdir("~/projects").unwrap_err();
+        assert!(matches!(err, TmuxError::InvalidWorkdir(_)));
+    }
+
+    #[test]
+    fn workdir_with_control_char_fails() {
+        let err = validate_workdir("/tmp/bad\npath").unwrap_err();
         assert!(matches!(err, TmuxError::InvalidWorkdir(_)));
     }
 
@@ -337,8 +412,15 @@ mod tests {
     }
 
     #[test]
+    fn status_string_with_hash_fails() {
+        // # triggers tmux format expansion (#() command exec, #{} variable)
+        let err = validate_status_string("status #{session_name}").unwrap_err();
+        assert!(matches!(err, TmuxError::InvalidStatusString(_)));
+    }
+
+    #[test]
     fn status_string_all_forbidden_chars_fail() {
-        for ch in ['$', '`', '\\', '"', '\'', '|', '&', ';', '<', '>'] {
+        for ch in ['$', '`', '\\', '"', '\'', '|', '&', ';', '<', '>', '#'] {
             let s = format!("bad{ch}char");
             assert!(
                 !is_valid_status_string(&s),
@@ -374,13 +456,11 @@ mod tests {
         let sessions = parse_list_output(output);
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].name, "mux-session");
-        assert_eq!(sessions[0].created, 1700000000);
-        assert_eq!(sessions[0].activity, 1700000100);
     }
 
     #[test]
     fn parse_filters_out_non_mux_sessions() {
-        let output = "other-session\t1700000000\t1700000100\nmux-mine\t1700001000\t1700001200\nwork\t1700002000\t1700002100\n";
+        let output = "other\t1700000000\t1700000100\nmux-mine\t1700001000\t1700001200\nwork\t1700002000\t1700002100\n";
         let sessions = parse_list_output(output);
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].name, "mux-mine");
@@ -388,7 +468,6 @@ mod tests {
 
     #[test]
     fn parse_skips_malformed_rows_wrong_field_count() {
-        // One field, three fields, five fields — all should be skipped
         let output = "mux-bad\nmux-also-bad\t1234\nmux-too-many\t1234\t5678\textra\nmux-good\t1700000000\t1700000100\n";
         let sessions = parse_list_output(output);
         assert_eq!(sessions.len(), 1);
@@ -402,7 +481,7 @@ mod tests {
             "not-mux\t3000\t4000\n",
             "malformed-row\n",
             "mux-valid2\t5000\t6000\r\n",
-            "\n", // empty line
+            "\n",
             "mux-valid3\t7000\t8000\n",
         );
         let sessions = parse_list_output(output);
@@ -422,6 +501,44 @@ mod tests {
         assert_eq!(sessions[0].activity, 8888);
     }
 
+    // ── is_no_sessions_error ──────────────────────────────────────────────────
+
+    #[test]
+    fn no_server_running_is_recognized() {
+        let err = TmuxError::TmuxFailed {
+            command: vec!["tmux".to_owned(), "list-sessions".to_owned()],
+            exit_code: Some(1),
+            stderr: "no server running on /tmp/tmux-1000/default".to_owned(),
+        };
+        assert!(is_no_sessions_error(&err));
+    }
+
+    #[test]
+    fn no_sessions_is_recognized() {
+        let err = TmuxError::TmuxFailed {
+            command: vec!["tmux".to_owned(), "list-sessions".to_owned()],
+            exit_code: Some(1),
+            stderr: "no sessions".to_owned(),
+        };
+        assert!(is_no_sessions_error(&err));
+    }
+
+    #[test]
+    fn real_tmux_error_not_swallowed() {
+        let err = TmuxError::TmuxFailed {
+            command: vec!["tmux".to_owned(), "list-sessions".to_owned()],
+            exit_code: Some(1),
+            stderr: "invalid option -- 'x'".to_owned(),
+        };
+        assert!(!is_no_sessions_error(&err));
+    }
+
+    #[test]
+    fn spawn_failed_not_swallowed() {
+        let err = TmuxError::SpawnFailed("No such file or directory".to_owned());
+        assert!(!is_no_sessions_error(&err));
+    }
+
     // ── Adapter construction ──────────────────────────────────────────────────
 
     #[test]
@@ -436,13 +553,23 @@ mod tests {
         assert_eq!(adapter.tmux_bin, "/usr/local/bin/tmux");
     }
 
-    // ── Validation integration (async new_session / kill_session guards) ──────
+    // ── Validation integration (async guards, no tmux needed) ─────────────────
 
     #[tokio::test]
     async fn new_session_rejects_bad_name() {
         let adapter = TmuxAdapter::default();
         let err = adapter
             .new_session("not-mux", "/tmp", None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TmuxError::InvalidSessionName(_)));
+    }
+
+    #[tokio::test]
+    async fn new_session_rejects_bare_mux_prefix() {
+        let adapter = TmuxAdapter::default();
+        let err = adapter
+            .new_session("mux-", "/tmp", None)
             .await
             .unwrap_err();
         assert!(matches!(err, TmuxError::InvalidSessionName(_)));
@@ -463,6 +590,16 @@ mod tests {
         let adapter = TmuxAdapter::default();
         let err = adapter
             .new_session("mux-test", "/tmp", Some("bad $CHARS here"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TmuxError::InvalidStatusString(_)));
+    }
+
+    #[tokio::test]
+    async fn new_session_rejects_hash_in_status_string() {
+        let adapter = TmuxAdapter::default();
+        let err = adapter
+            .new_session("mux-test", "/tmp", Some("#{session_name}"))
             .await
             .unwrap_err();
         assert!(matches!(err, TmuxError::InvalidStatusString(_)));
