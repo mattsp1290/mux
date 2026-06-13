@@ -2,6 +2,8 @@
 # Loaded from /etc/ssh/sshd_config.d/mux-test.conf
 
 AllowAgentForwarding yes
+# PermitUserEnvironment: allows tests to inject MUX_HOME and similar via
+# SendEnv/AcceptEnv. Remove if no test relies on it to reduce surface area.
 PermitUserEnvironment yes
 PubkeyAuthentication yes
 PasswordAuthentication no

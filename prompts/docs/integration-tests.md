@@ -29,7 +29,7 @@ Each test host container must provide:
 | `sha256sum` | For agent deploy verification |
 | No MOTD noise | Or a controlled, parseable MOTD for MOTD-noise tests |
 | Writable `$HOME` | `/home/testuser` |
-| `ssh-agent` forwarding support | `ForwardAgent yes` via `authorized_keys` options |
+| `ssh-agent` forwarding support | `AllowAgentForwarding yes` in `sshd_config` (server-side) |
 
 The SSH server accepts the **test identity key** (`docker/test-host/test_ed25519`)
 in `authorized_keys`. The test identity is an ed25519 key generated once and committed
@@ -166,8 +166,8 @@ Testing transport selection requires the ability to make the Unix socket unavail
 | `MUX_FORCE_TRANSPORT=tcp` | Force TCP regardless of socket availability |
 | Transport persisted | After create, kill agent's socket; `mux attach` reads persisted mode |
 
-The container's socket path is `/home/testuser/.mux/mux-agent.sock`. To simulate
-streamlocal failure: `ssh testuser@host 'rm ~/.mux/mux-agent.sock'` after agent starts.
+The container's socket path is `/home/testuser/.mux/agent.sock` (see `agent_start.rs:93`).
+To simulate streamlocal failure: `ssh testuser@host 'rm ~/.mux/agent.sock'` after agent starts.
 
 ### 5. `mux create` / `mux list` / `mux status`
 
@@ -230,23 +230,29 @@ The clone will fail with a network error; mux must surface it with exit 1 and th
 
 Prerequisites:
 1. Docker Desktop or Docker Engine running
-2. `mux` binary on `PATH` (or `MUX_BIN` env var pointing to target build)
+2. `cargo build -p mux` run at least once (the harness uses `CARGO_BIN_EXE_mux`,
+   set automatically by Cargo; or override with `MUX_BIN=/path/to/mux`)
 3. `docker compose` available
 
 ```bash
 # Start test hosts (idempotent)
 docker compose -f docker/test-host/docker-compose.yml up -d
 
-# Run integration tests
-cargo test --test integration --features integration-tests
+# Run integration tests (serial — shared containers must not race)
+cargo test -p mux-integration-tests --test integration --features integration-tests -- --test-threads=1
 
 # Tear down
 docker compose -f docker/test-host/docker-compose.yml down
 ```
 
-The test harness auto-starts containers if not running; the `TestHost::Drop` impl
-tears down after each test. Tests can run concurrently because each test uses an
-isolated `MUX_HOME` and container-side isolation (separate tmux sessions).
+The test harness auto-starts containers if not running. Each test uses an isolated
+`MUX_HOME` and creates uniquely-named tmux sessions.
+
+**Important**: tests that share a container service (same fixed port) cannot run
+concurrently — one test's `Drop` would tear down the shared container while another
+test is using it. Use `--test-threads=1` when running integration tests, or annotate
+container-touching tests with `#[serial_test::serial]` (add `serial_test` as a
+dev-dependency when the crate is created).
 
 ### CI run
 
@@ -263,9 +269,14 @@ and on tags. They can be opt-in on PRs via a label (`run-integration-tests`).
 
 ### Skip condition
 
-If Docker is not available (`docker info` fails), the test harness emits
-`cargo test::ignore` for all integration tests and exits 0. This allows the unit-test
-CI job to pass on runners without Docker.
+The `integration-tests` feature gate is the primary skip mechanism — without
+`--features integration-tests`, the integration crate is never compiled, so Docker
+is never required. This is how unit-test CI passes on runners without Docker.
+
+If the feature is enabled but Docker is not running, `require_docker!()` calls `return`
+early from each test function. Cargo reports these as PASSED (not skipped); a note is
+printed to stderr. For CI, prefer the feature-gate approach rather than relying on
+`require_docker!()` for skip semantics.
 
 ---
 
