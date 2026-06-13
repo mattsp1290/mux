@@ -1,3 +1,6 @@
+/// Adapter for direct tmux invocation (no shell). Will hold a configurable
+/// tmux binary path once mux-8m1 is implemented.
+#[derive(Default)]
 pub struct TmuxAdapter;
 
 impl TmuxAdapter {

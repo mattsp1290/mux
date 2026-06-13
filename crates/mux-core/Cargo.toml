@@ -10,4 +10,7 @@ description = "Shared mux domain types and validation"
 anyhow.workspace = true
 thiserror.workspace = true
 serde.workspace = true
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
