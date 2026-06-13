@@ -618,6 +618,51 @@ mod tests {
         assert_eq!(count, 0, "fingerprints should be cascade-deleted");
     }
 
+    // ── add validation edge cases ─────────────────────────────────────────────
+
+    #[test]
+    fn add_empty_user_errors() {
+        let (_dir, store) = open_store();
+        let conn = store.conn();
+        let err = cmd_add(conn, "myhost".to_owned(), "@10.0.0.1".to_owned(), 22).unwrap_err();
+        assert!(err.to_string().contains("user"), "got: {err}");
+    }
+
+    #[test]
+    fn add_empty_addr_errors() {
+        let (_dir, store) = open_store();
+        let conn = store.conn();
+        let err = cmd_add(conn, "myhost".to_owned(), "user@".to_owned(), 22).unwrap_err();
+        assert!(err.to_string().contains("addr"), "got: {err}");
+    }
+
+    // ── list: multiple hosts ──────────────────────────────────────────────────
+
+    #[test]
+    fn list_multiple_hosts_shows_all() {
+        let (_dir, store) = open_store();
+        let conn = store.conn();
+        cmd_add(conn, "alpha".to_owned(), "alice@10.0.0.1".to_owned(), 22).unwrap();
+        cmd_add(conn, "beta".to_owned(), "bob@10.0.0.2".to_owned(), 2222).unwrap();
+        // Both hosts exist in db; cmd_list should not error.
+        cmd_list(conn).unwrap();
+        let hosts = host_repo::list(conn).unwrap();
+        assert_eq!(hosts.len(), 2, "both hosts should be in inventory");
+    }
+
+    // ── remove: confirmation decline ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn remove_no_confirmation_aborts_without_removing() {
+        let (_dir, store) = open_store();
+        let conn = store.conn();
+        cmd_add(conn, "keephost".to_owned(), "user@10.0.0.7".to_owned(), 22).unwrap();
+        // yes=false; stdin is empty in test (read_line returns ""), trimmed != "y" → abort.
+        cmd_remove(conn, "keephost".to_owned(), false).await.unwrap();
+        let host = host_repo::get_by_alias(conn, "keephost").unwrap();
+        assert!(host.is_some(), "host should still exist after declined confirmation");
+    }
+
     // ── new: preflight parsing ────────────────────────────────────────────────
 
     #[test]
