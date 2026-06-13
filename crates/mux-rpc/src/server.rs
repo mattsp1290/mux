@@ -19,12 +19,22 @@ use crate::schema::{
     ShutdownResponse,
 };
 
+// ── Codec constants ───────────────────────────────────────────────────────────
+
+/// Maximum frame body size (4 MiB). Rejects attacker-controlled length prefixes
+/// before allocating, preventing OOM from a forged large-frame attack.
+const MAX_FRAME_LEN: usize = 4 * 1024 * 1024;
+
 // ── Ownership map ─────────────────────────────────────────────────────────────
 
 struct OwnedSession {
+    shortname: String,
     tmux_name: String,
     repo_slug: String,
     workdir: String,
+    /// True for sessions created via CreateSession (agent manages workdir removal).
+    /// False for imported sessions (workdir must never be deleted by the agent).
+    mux_created: bool,
 }
 
 type OwnershipMap = Arc<Mutex<HashMap<String, OwnedSession>>>;
@@ -117,13 +127,18 @@ async fn read_message(stream: &mut TcpStream) -> anyhow::Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).await?;
     let len = u32::from_le_bytes(len_buf) as usize;
+    anyhow::ensure!(
+        len <= MAX_FRAME_LEN,
+        "frame too large: {len} bytes (max {MAX_FRAME_LEN})"
+    );
     let mut body = vec![0u8; len];
     stream.read_exact(&mut body).await?;
     Ok(body)
 }
 
 async fn write_message(stream: &mut TcpStream, body: &[u8]) -> anyhow::Result<()> {
-    let len = body.len() as u32;
+    let len = u32::try_from(body.len())
+        .map_err(|_| anyhow::anyhow!("response body too large to frame: {} bytes", body.len()))?;
     stream.write_all(&len.to_le_bytes()).await?;
     stream.write_all(body).await?;
     Ok(())
@@ -155,7 +170,7 @@ async fn handle_connection(
             }
         };
 
-        // Signals shutdown after response is sent; None means normal operation.
+        // Set to true when Shutdown is dispatched; triggers watch signal after response.
         let mut trigger_shutdown = false;
 
         let response_bytes: Vec<u8> = match request {
@@ -185,9 +200,11 @@ async fn handle_connection(
                                 map.insert(
                                     req.uuid.clone(),
                                     OwnedSession {
+                                        shortname: req.shortname.clone(),
                                         tmux_name: tmux_name.clone(),
                                         repo_slug: req.repo_slug,
                                         workdir,
+                                        mux_created: true,
                                     },
                                 );
                             }
@@ -223,14 +240,9 @@ async fn handle_connection(
                                     } else {
                                         SessionStatusValue::Dead
                                     };
-                                    let shortname = entry
-                                        .tmux_name
-                                        .strip_prefix("mux-")
-                                        .unwrap_or(&entry.tmux_name)
-                                        .to_owned();
                                     SessionInfo {
                                         uuid: uuid.clone(),
-                                        shortname,
+                                        shortname: entry.shortname.clone(),
                                         tmux_name: entry.tmux_name.clone(),
                                         workdir: entry.workdir.clone(),
                                         status,
@@ -248,7 +260,7 @@ async fn handle_connection(
             Request::GetSession(req) => {
                 let entry_info = {
                     let map = ownership.lock().unwrap();
-                    map.get(&req.uuid).map(|e| (e.tmux_name.clone(), e.workdir.clone()))
+                    map.get(&req.uuid).map(|e| (e.shortname.clone(), e.tmux_name.clone()))
                 };
 
                 match entry_info {
@@ -260,7 +272,7 @@ async fn handle_connection(
                             )));
                         serde_json::to_vec(&err).unwrap_or_default()
                     }
-                    Some((tmux_name, _workdir)) => {
+                    Some((shortname, tmux_name)) => {
                         match tmux.list_sessions().await {
                             Err(e) => {
                                 let err: RpcResult<GetSessionResponse> =
@@ -275,10 +287,6 @@ async fn handle_connection(
                                 } else {
                                     SessionStatusValue::Dead
                                 };
-                                let shortname = tmux_name
-                                    .strip_prefix("mux-")
-                                    .unwrap_or(&tmux_name)
-                                    .to_owned();
                                 let resp: RpcResult<GetSessionResponse> =
                                     RpcResult::Ok(GetSessionResponse {
                                         uuid: req.uuid,
@@ -296,7 +304,9 @@ async fn handle_connection(
             Request::KillSession(req) => {
                 let entry_info = {
                     let map = ownership.lock().unwrap();
-                    map.get(&req.uuid).map(|e| (e.tmux_name.clone(), e.repo_slug.clone(), e.workdir.clone()))
+                    map.get(&req.uuid).map(|e| {
+                        (e.tmux_name.clone(), e.repo_slug.clone(), e.workdir.clone(), e.mux_created)
+                    })
                 };
 
                 match entry_info {
@@ -305,7 +315,7 @@ async fn handle_connection(
                             RpcResult::Err(RpcError::not_owned("session not in ownership map"));
                         serde_json::to_vec(&err).unwrap_or_default()
                     }
-                    Some((tmux_name, repo_slug, workdir)) => {
+                    Some((tmux_name, repo_slug, workdir, mux_created)) => {
                         if req.repo_slug != repo_slug {
                             let err: RpcResult<KillSessionResponse> =
                                 RpcResult::Err(RpcError::not_owned("repo_slug mismatch"));
@@ -314,7 +324,7 @@ async fn handle_connection(
                             let tmux_killed = match tmux.kill_session(&tmux_name).await {
                                 Ok(()) => true,
                                 Err(e) => {
-                                    // "already gone" style errors count as killed
+                                    // Session already gone counts as killed.
                                     let msg = e.to_string().to_ascii_lowercase();
                                     if msg.contains("no server running")
                                         || msg.contains("no sessions")
@@ -324,18 +334,32 @@ async fn handle_connection(
                                         true
                                     } else {
                                         tracing::warn!(error = %e, "kill_session tmux error");
-                                        true // still remove from map
+                                        false
                                     }
                                 }
                             };
 
-                            let workdir_removed = match std::fs::remove_dir_all(&workdir) {
-                                Ok(()) => true,
-                                Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-                                Err(e) => {
-                                    tracing::warn!(error = %e, path = %workdir, "remove_dir_all failed");
-                                    false
+                            // Only remove mux-created workdirs; never touch imported ones.
+                            let workdir_removed = if mux_created {
+                                let workdir_clone = workdir.clone();
+                                match tokio::task::spawn_blocking(move || {
+                                    std::fs::remove_dir_all(&workdir_clone)
+                                })
+                                .await
+                                {
+                                    Ok(Ok(())) => true,
+                                    Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => false,
+                                    Ok(Err(e)) => {
+                                        tracing::warn!(error = %e, path = %workdir, "remove_dir_all failed");
+                                        false
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(error = %e, "spawn_blocking join error");
+                                        false
+                                    }
                                 }
+                            } else {
+                                false
                             };
 
                             {
@@ -362,11 +386,8 @@ async fn handle_connection(
             }
 
             Request::StreamSessionEvents(_) => {
-                // Not implemented in v0.1
-                let err = serde_json::json!({
-                    "error": "internal",
-                    "message": "streaming not implemented"
-                });
+                let err: RpcResult<crate::schema::ShutdownResponse> =
+                    RpcResult::Err(RpcError::internal("streaming not implemented"));
                 serde_json::to_vec(&err).unwrap_or_default()
             }
         };
