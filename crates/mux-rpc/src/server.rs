@@ -1404,6 +1404,8 @@ mod tests {
         let mut stream = TcpStream::connect(addr).await.unwrap();
         send_request(&mut stream, &serde_json::json!({"op": "Health"})).await;
 
+        // `serve()` publishes no bus events before the first request; the first recv is
+        // guaranteed to be the RpcRequest from the Health dispatch above.
         let event = tokio::time::timeout(Duration::from_millis(500), rx.recv())
             .await
             .expect("timed out waiting for bus event")
@@ -1433,6 +1435,8 @@ mod tests {
         )
         .await;
 
+        // `serve()` publishes no bus events before the first request (no AgentStarted on the
+        // in-process server, which is agent-side only). First recv is guaranteed to be our event.
         let event = tokio::time::timeout(Duration::from_millis(500), rx.recv())
             .await
             .expect("timed out waiting for bus event")
@@ -1442,6 +1446,34 @@ mod tests {
             BusEvent::RpcRequest(e) => {
                 assert_eq!(e.method, "GetSession", "method must be 'GetSession'");
                 assert!(!e.success, "not_found error must be success=false");
+            }
+            other => panic!("expected BusEvent::RpcRequest, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn rpc_bus_publishes_rpc_request_with_success_false_on_tmux_backend_error() {
+        use std::time::Duration;
+
+        // ListSessions with a tmux backend error → tmux_error response → success=false.
+        // Covers a different dispatch_success=false branch from the not_found case.
+        let mock = MockTmuxOps::new().with_list_sessions_error("tmux: no server running");
+        let bus = Arc::new(EventBus::new());
+        let (addr, mut rx) = start_server_with_bus(mock, bus).await;
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let resp = send_request(&mut stream, &serde_json::json!({"op": "ListSessions"})).await;
+        assert_eq!(resp["error"], "tmux_error", "backend error must propagate: {resp}");
+
+        let event = tokio::time::timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .expect("timed out waiting for bus event")
+            .expect("channel closed");
+
+        match event {
+            BusEvent::RpcRequest(e) => {
+                assert_eq!(e.method, "ListSessions");
+                assert!(!e.success, "tmux backend error must be success=false");
             }
             other => panic!("expected BusEvent::RpcRequest, got: {other:?}"),
         }

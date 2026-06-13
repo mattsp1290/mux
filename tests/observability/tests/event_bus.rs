@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 // ── Non-blocking semantic tests ───────────────────────────────────────────────
 
-#[tokio::test]
-async fn subscriber_after_publish_misses_event() {
+#[test]
+fn subscriber_after_publish_misses_event() {
     // Publish before subscribing → the event is not buffered for late subscribers.
     let bus = EventBus::new();
     bus.publish(BusEvent::AgentStopped);
@@ -19,17 +19,22 @@ async fn subscriber_after_publish_misses_event() {
 
 #[tokio::test]
 async fn publish_does_not_block_with_slow_subscriber() {
+    use std::time::Duration;
     // Fill the buffer twice over without reading — publish must return immediately every time.
-    let bus = Arc::new(EventBus::new());
-    let mut _rx = bus.subscribe(); // hold a receiver so send() doesn't return Err
-    for i in 0..(BUS_CAPACITY * 2) as u64 {
-        bus.publish(BusEvent::RpcRequest(RpcRequestEvent {
-            method: "Health".into(),
-            duration_ms: i,
-            success: true,
-        }));
-    }
-    // If we reach here without blocking or panicking, the test passes.
+    // Wrapped in a timeout so a hypothetical deadlock fails fast rather than hanging the suite.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let bus = Arc::new(EventBus::new());
+        let _rx = bus.subscribe(); // hold a receiver so send() doesn't return Err
+        for i in 0..(BUS_CAPACITY * 2) as u64 {
+            bus.publish(BusEvent::RpcRequest(RpcRequestEvent {
+                method: "Health".into(),
+                duration_ms: i,
+                success: true,
+            }));
+        }
+    })
+    .await
+    .expect("publish_does_not_block_with_slow_subscriber: timed out (publish blocked)");
 }
 
 #[tokio::test]
@@ -58,7 +63,8 @@ async fn publish_to_lagged_subscriber_does_not_panic() {
 // ── Signal field name / structure tests ───────────────────────────────────────
 
 #[test]
-fn bus_capacity_is_64() {
+fn bus_capacity_matches_spec() {
+    // Tripwire: if BUS_CAPACITY is changed, update the spec reference in docs/08.
     assert_eq!(BUS_CAPACITY, 64, "bus capacity must be 64 (spec §create-flow-observability)");
 }
 
@@ -93,7 +99,9 @@ fn create_flow_event_has_required_fields() {
 
 #[test]
 fn error_category_values_are_well_known() {
-    // Document and exercise the four error categories used in create.rs.
+    // Document the four error categories currently used in create.rs.
+    // NOTE: this test asserts round-trips on known values but does NOT fail if
+    // create.rs adds a new category — that would require a shared const or enum.
     let categories = [
         "git_clone_failed",
         "agent_start_failed",
