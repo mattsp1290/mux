@@ -12,6 +12,7 @@ mux-state = { path = "../mux-state" }
 mux-ssh = { path = "../mux-ssh" }
 mux-rpc = { path = "../mux-rpc" }
 anyhow.workspace = true
+tempfile.workspace = true
 uuid.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
