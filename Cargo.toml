@@ -27,8 +27,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
-uuid = { version = "1", features = ["v4", "serde"] }
-# dev-only
+uuid = { version = "1", features = ["v4", "serde"] }  # v4: reserved for session-create (mux-create)
+# dev-only — reserved for mux-cli e2e integration tests (mux-cli-tests)
 assert_cmd = "2"
 predicates = "3"
 tempfile = "3"
