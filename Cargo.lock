@@ -610,6 +610,7 @@ name = "mux-tmux"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "tempfile",
  "thiserror",
  "tokio",
  "tracing",

@@ -182,4 +182,39 @@ mod tests {
             TransportMode::Tcp
         );
     }
+
+    // ── read_force_transport (reads env var) ──────────────────────────────────
+
+    #[test]
+    fn read_force_transport_unset_returns_none() {
+        std::env::remove_var(MUX_FORCE_TRANSPORT_ENV);
+        assert_eq!(read_force_transport().unwrap(), None);
+    }
+
+    #[test]
+    fn read_force_transport_streamlocal() {
+        std::env::set_var(MUX_FORCE_TRANSPORT_ENV, "streamlocal");
+        let result = read_force_transport().unwrap();
+        std::env::remove_var(MUX_FORCE_TRANSPORT_ENV);
+        assert_eq!(result, Some(TransportMode::Streamlocal));
+    }
+
+    #[test]
+    fn read_force_transport_tcp() {
+        std::env::set_var(MUX_FORCE_TRANSPORT_ENV, "tcp");
+        let result = read_force_transport().unwrap();
+        std::env::remove_var(MUX_FORCE_TRANSPORT_ENV);
+        assert_eq!(result, Some(TransportMode::Tcp));
+    }
+
+    #[test]
+    fn read_force_transport_invalid_errors() {
+        std::env::set_var(MUX_FORCE_TRANSPORT_ENV, "rdma");
+        let result = read_force_transport();
+        std::env::remove_var(MUX_FORCE_TRANSPORT_ENV);
+        assert!(
+            matches!(result, Err(MuxError::InvalidForceTransport(ref s)) if s == "rdma"),
+            "expected InvalidForceTransport(\"rdma\"), got {result:?}"
+        );
+    }
 }
