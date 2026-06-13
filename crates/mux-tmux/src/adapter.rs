@@ -611,4 +611,308 @@ mod tests {
         let err = adapter.kill_session("no-prefix").await.unwrap_err();
         assert!(matches!(err, TmuxError::InvalidSessionName(_)));
     }
+
+    // ── Parsing: additional edge cases ───────────────────────────────────────
+
+    #[test]
+    fn parse_preserves_duplicate_session_names() {
+        // Unexpected but must not panic — both entries preserved in order.
+        let output = "mux-same\t1000\t2000\nmux-same\t3000\t4000\n";
+        let sessions = parse_list_output(output);
+        assert_eq!(sessions.len(), 2, "duplicates must be preserved");
+        assert_eq!(sessions[0].created, 1000);
+        assert_eq!(sessions[1].created, 3000);
+    }
+
+    #[test]
+    fn parse_skips_row_with_non_numeric_created() {
+        let output = "mux-bad\tNOTANUM\t2000\nmux-good\t1000\t2000\n";
+        let sessions = parse_list_output(output);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].name, "mux-good");
+    }
+
+    #[test]
+    fn parse_skips_row_with_non_numeric_activity() {
+        let output = "mux-bad\t1000\tNOTANUM\nmux-good\t1000\t2000\n";
+        let sessions = parse_list_output(output);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].name, "mux-good");
+    }
+
+    #[test]
+    fn parse_zero_timestamps_are_valid_u64() {
+        let output = "mux-zero\t0\t0\n";
+        let sessions = parse_list_output(output);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].created, 0u64);
+        assert_eq!(sessions[0].activity, 0u64);
+    }
+
+    #[test]
+    fn parse_large_timestamp_values() {
+        // u64::MAX-like values (tmux timestamps won't be this large, but parse must not truncate)
+        let large = u64::MAX.to_string();
+        let output = format!("mux-large\t{large}\t{large}\n");
+        let sessions = parse_list_output(&output);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].created, u64::MAX);
+    }
+
+    #[test]
+    fn parse_only_whitespace_lines_returns_empty() {
+        let output = "   \n\t\n\n";
+        // Lines with only spaces/tabs are not "\r"-stripped and not empty after trim_end_matches,
+        // but they will fail the 3-field split → skipped. Result is empty.
+        // (Blank lines after strip are explicitly skipped.)
+        let sessions = parse_list_output(output);
+        // Whitespace-only lines: "   " has 1 field → skipped. "\t" has 2 fields → skipped. "" → skipped.
+        assert!(sessions.is_empty(), "whitespace-only lines must not produce sessions");
+    }
+
+    #[test]
+    fn parse_negative_looking_string_in_timestamp_fails() {
+        // "-1" is a valid i64 but not a valid u64.
+        let output = "mux-neg\t-1\t1000\n";
+        let sessions = parse_list_output(output);
+        assert!(sessions.is_empty(), "negative timestamp must not parse as u64");
+    }
+
+    // ── is_no_sessions_error additional cases ─────────────────────────────────
+
+    #[test]
+    fn error_connecting_is_recognized_as_no_sessions() {
+        let err = TmuxError::TmuxFailed {
+            command: vec!["tmux".to_owned(), "list-sessions".to_owned()],
+            exit_code: Some(1),
+            stderr: "error connecting to /tmp/tmux-1000/default (No such file or directory)"
+                .to_owned(),
+        };
+        assert!(is_no_sessions_error(&err), "error connecting must be recognized");
+    }
+
+    #[test]
+    fn is_no_sessions_error_case_insensitive() {
+        let err = TmuxError::TmuxFailed {
+            command: vec!["tmux".to_owned()],
+            exit_code: Some(1),
+            stderr: "No Server Running on /tmp/tmux-1000/default".to_owned(),
+        };
+        assert!(is_no_sessions_error(&err), "check must be case-insensitive");
+    }
+
+    // ── Argv shape tests (fake binary) ────────────────────────────────────────
+
+    /// A fake tmux binary that records every invocation's argv to a temp file
+    /// and exits 0. Used to verify exact argv shapes without running real tmux.
+    struct TmuxSpy {
+        // _dir keeps the TempDir (and its files) alive for the lifetime of this struct.
+        _dir: tempfile::TempDir,
+        log_path: std::path::PathBuf,
+        bin_path: std::path::PathBuf,
+    }
+
+    impl TmuxSpy {
+        fn new() -> Self {
+            use std::io::Write;
+            use std::os::unix::fs::PermissionsExt;
+
+            let dir = tempfile::TempDir::new().unwrap();
+            let log_path = dir.path().join("calls.log");
+            let bin_path = dir.path().join("fake-tmux");
+
+            // Script: record NUL-separated argv per call, then a bare \n as call separator.
+            // Exits 0 — list-sessions returning empty stdout counts as "no sessions".
+            let script_body = format!(
+                "#!/bin/sh\nprintf '%s\\0' \"$@\" >> '{}'\nprintf '\\n' >> '{}'\nexit 0\n",
+                log_path.display(),
+                log_path.display(),
+            );
+
+            // Write and explicitly close the file — on Linux the binary cannot be exec'd
+            // while any writer fd is open (ETXTBSY). Drop the File handle before exec.
+            {
+                let mut f = std::fs::File::create(&bin_path).unwrap();
+                f.write_all(script_body.as_bytes()).unwrap();
+                // f is dropped here
+            }
+            std::fs::set_permissions(&bin_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+            Self { _dir: dir, log_path, bin_path }
+        }
+
+        fn adapter(&self) -> TmuxAdapter {
+            TmuxAdapter::with_bin(self.bin_path.to_str().unwrap())
+        }
+
+        /// Returns all recorded invocations as `Vec<Vec<String>>` (outer = calls, inner = args).
+        fn calls(&self) -> Vec<Vec<String>> {
+            let content = std::fs::read_to_string(&self.log_path).unwrap_or_default();
+            content
+                .split('\n')
+                .filter(|s| !s.is_empty())
+                .map(|call| {
+                    call.split('\0')
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .collect()
+        }
+    }
+
+    #[tokio::test]
+    async fn new_session_argv_is_direct_detached_no_shell_flags() {
+        let spy = TmuxSpy::new();
+        let adapter = spy.adapter();
+        adapter
+            .new_session("mux-myrepo", "/home/user/repo", None)
+            .await
+            .unwrap();
+        let calls = spy.calls();
+        assert_eq!(calls.len(), 1, "no status_right → one tmux call");
+        let args = &calls[0];
+        assert_eq!(
+            args,
+            &["new-session", "-d", "-s", "mux-myrepo", "-c", "/home/user/repo"],
+            "argv must match documented shape exactly"
+        );
+    }
+
+    #[tokio::test]
+    async fn new_session_argv_no_g_no_l_no_f_flags() {
+        let spy = TmuxSpy::new();
+        spy.adapter()
+            .new_session("mux-test", "/tmp", None)
+            .await
+            .unwrap();
+        let calls = spy.calls();
+        for call in &calls {
+            for arg in call {
+                assert_ne!(arg, "-g", "global flag -g must never appear");
+                assert_ne!(arg, "-L", "socket flag -L must never appear");
+                assert_ne!(arg, "-f", "config flag -f must never appear");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn new_session_with_status_right_issues_three_calls_in_order() {
+        let spy = TmuxSpy::new();
+        spy.adapter()
+            .new_session("mux-s", "/tmp", Some("session: test [ok]"))
+            .await
+            .unwrap();
+        let calls = spy.calls();
+        assert_eq!(calls.len(), 3, "new-session + 2 set-option calls");
+
+        // First call must be new-session (session must exist before set-option).
+        assert_eq!(calls[0][0], "new-session", "first call must be new-session");
+
+        // Second call: enable status bar.
+        assert_eq!(
+            calls[1],
+            &["set-option", "-t", "mux-s", "status", "on"],
+            "second call must enable status with 'on' (not '1')"
+        );
+
+        // Third call: set status-right content.
+        assert_eq!(
+            calls[2],
+            &["set-option", "-t", "mux-s", "status-right", "session: test [ok]"],
+            "third call must set status-right"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_option_uses_session_target_not_global() {
+        let spy = TmuxSpy::new();
+        spy.adapter()
+            .new_session("mux-tgt", "/tmp", Some("info"))
+            .await
+            .unwrap();
+        let calls = spy.calls();
+        // Calls 1 and 2 are set-option; both must use -t not -g.
+        for call in calls.iter().skip(1) {
+            assert_eq!(call[0], "set-option");
+            let t_pos = call
+                .iter()
+                .position(|a| a == "-t")
+                .expect("set-option must have -t flag for session-scoped option");
+            assert!(t_pos + 1 < call.len(), "-t must be followed by session name");
+            assert_eq!(call[t_pos + 1], "mux-tgt", "-t must target the session");
+            assert!(
+                !call.contains(&"-g".to_owned()),
+                "set-option must not use -g (global)"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn kill_session_argv_shape() {
+        let spy = TmuxSpy::new();
+        spy.adapter().kill_session("mux-dead").await.unwrap();
+        let calls = spy.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0],
+            &["kill-session", "-t", "mux-dead"],
+            "kill-session argv must match documented shape"
+        );
+    }
+
+    #[tokio::test]
+    async fn kill_session_argv_no_g_no_l_flags() {
+        let spy = TmuxSpy::new();
+        spy.adapter().kill_session("mux-s").await.unwrap();
+        for arg in &spy.calls()[0] {
+            assert_ne!(arg, "-g");
+            assert_ne!(arg, "-L");
+            assert_ne!(arg, "-f");
+        }
+    }
+
+    #[tokio::test]
+    async fn list_sessions_argv_uses_exact_format_string() {
+        let spy = TmuxSpy::new();
+        spy.adapter().list_sessions().await.unwrap();
+        let calls = spy.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0][0], "list-sessions");
+        // Must use -F with the exact tab-separated format string from the contract.
+        let f_pos = calls[0]
+            .iter()
+            .position(|a| a == "-F")
+            .expect("list-sessions must use -F format flag");
+        assert_eq!(
+            calls[0][f_pos + 1],
+            "#{session_name}\t#{session_created}\t#{session_activity}",
+            "format string must match contract exactly"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_sessions_argv_no_g_no_l_flags() {
+        let spy = TmuxSpy::new();
+        spy.adapter().list_sessions().await.unwrap();
+        for arg in &spy.calls()[0] {
+            assert_ne!(arg, "-g");
+            assert_ne!(arg, "-L");
+            assert_ne!(arg, "-f");
+        }
+    }
+
+    #[tokio::test]
+    async fn new_session_no_status_right_makes_no_set_option_calls() {
+        let spy = TmuxSpy::new();
+        spy.adapter()
+            .new_session("mux-bare", "/tmp", None)
+            .await
+            .unwrap();
+        let calls = spy.calls();
+        assert!(
+            calls.iter().all(|c| c[0] != "set-option"),
+            "without status_right, no set-option must be issued"
+        );
+    }
 }
