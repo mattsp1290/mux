@@ -9,6 +9,7 @@ pub mod attach;
 pub mod create;
 pub mod host;
 pub mod kill;
+pub mod list;
 pub mod mux_home;
 pub mod status;
 
@@ -55,7 +56,11 @@ pub enum Command {
         selector: String,
     },
     /// List sessions
-    List,
+    List {
+        /// Tab-separated output without ANSI (machine-readable)
+        #[arg(long)]
+        plain: bool,
+    },
     /// Show session status
     Status {
         /// UUID or shortname of the session
@@ -139,7 +144,8 @@ pub async fn run(command: Command, mux_home: PathBuf) -> Result<()> {
         Command::Create { .. } => anyhow::bail!("mux create: SSH execution not yet implemented"),
         // TODO: wire to prepare_attach + exec once a real SshHost SSH impl lands.
         Command::Attach { .. } => anyhow::bail!("mux attach: SSH execution not yet implemented"),
-        Command::List => todo!("mux list"),
+        // TODO: wire to run_list once a real RemoteExec SSH impl lands.
+        Command::List { .. } => anyhow::bail!("mux list: SSH execution not yet implemented"),
         // TODO: wire to run_status once a real RemoteExec SSH impl lands.
         Command::Status { .. } => anyhow::bail!("mux status: SSH execution not yet implemented"),
         // TODO: wire to run_kill once a real SshHost SSH impl lands (currently no
