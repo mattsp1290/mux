@@ -1,4 +1,334 @@
-// TOFU host-key trust — implementation in mux-uk7
-pub fn verify_host_key(_host: &str, _fingerprint: &str) -> anyhow::Result<()> {
-    todo!("TOFU host-key verification (mux-uk7)")
+//! SSH host-key TOFU trust logic and SSH agent key enumeration.
+//!
+//! Spec: docs/04-ssh-trust-and-transport.md
+
+use std::io::{Read, Write};
+use std::os::unix::net::UnixStream;
+
+use anyhow::Result;
+use mux_state::fingerprint_repo;
+
+// ── Algorithm preference order for attach pinning ────────────────────────────
+
+const ALG_PREFERENCE: &[&str] = &[
+    "ssh-ed25519",
+    "ecdsa-sha2-nistp256",
+    "rsa-sha2-512",
+    "rsa-sha2-256",
+];
+
+// ── Public types ─────────────────────────────────────────────────────────────
+
+/// Result of checking a host key against stored records.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TrustCheckResult {
+    /// Stored fingerprint matches — proceed silently.
+    Trusted,
+    /// No stored record for this algorithm — first contact.
+    FirstContact { algorithm: String, fingerprint: String },
+    /// Stored record differs — abort; never connect.
+    Mismatch { algorithm: String, stored: String, received: String },
+}
+
+/// A public key offered by the SSH agent.
+#[derive(Debug, Clone)]
+pub struct AgentKey {
+    pub algorithm: String,
+    pub key_blob: Vec<u8>,
+    pub comment: String,
+}
+
+// ── Public functions ──────────────────────────────────────────────────────────
+
+/// Check a received server host-key fingerprint against stored records.
+pub fn check_host_key(
+    conn: &rusqlite::Connection,
+    host_id: i64,
+    algorithm: &str,
+    received_fingerprint: &str,
+) -> Result<TrustCheckResult> {
+    match fingerprint_repo::get(conn, host_id, algorithm)? {
+        None => Ok(TrustCheckResult::FirstContact {
+            algorithm: algorithm.to_owned(),
+            fingerprint: received_fingerprint.to_owned(),
+        }),
+        Some(stored) if stored.fingerprint == received_fingerprint => Ok(TrustCheckResult::Trusted),
+        Some(stored) => Ok(TrustCheckResult::Mismatch {
+            algorithm: algorithm.to_owned(),
+            stored: stored.fingerprint,
+            received: received_fingerprint.to_owned(),
+        }),
+    }
+}
+
+/// Persist a trust decision after user confirms first-contact.
+pub fn trust_fingerprint(
+    conn: &rusqlite::Connection,
+    host_id: i64,
+    algorithm: &str,
+    fingerprint: &str,
+) -> Result<()> {
+    let trusted_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time before epoch")
+        .as_secs() as i64;
+    fingerprint_repo::upsert(conn, host_id, algorithm, fingerprint, trusted_at)
+}
+
+/// Select the best stored fingerprint for `mux attach` (algorithm preference order).
+///
+/// Returns `None` if the host has no stored fingerprints.
+pub fn preferred_fingerprint_for_attach<'a>(
+    fingerprints: &'a [mux_state::model::KnownHostFingerprint],
+) -> Option<&'a mux_state::model::KnownHostFingerprint> {
+    if fingerprints.is_empty() {
+        return None;
+    }
+    for preferred_alg in ALG_PREFERENCE {
+        if let Some(fp) = fingerprints.iter().find(|fp| fp.algorithm == *preferred_alg) {
+            return Some(fp);
+        }
+    }
+    // No known algorithm matched — return the first entry as-is.
+    fingerprints.first()
+}
+
+/// Enumerate public keys from the SSH agent at `SSH_AUTH_SOCK`.
+///
+/// Returns `Err(MuxError::SshAgentNotForwarded)` if `SSH_AUTH_SOCK` is not set
+/// or the socket cannot be connected.
+pub fn list_agent_keys() -> Result<Vec<AgentKey>, mux_core::error::MuxError> {
+    let sock_path = std::env::var("SSH_AUTH_SOCK").unwrap_or_default();
+    if sock_path.is_empty() {
+        return Err(mux_core::error::MuxError::SshAgentNotForwarded);
+    }
+
+    let mut stream =
+        UnixStream::connect(&sock_path).map_err(|_| mux_core::error::MuxError::SshAgentNotForwarded)?;
+
+    // Send SSH2_AGENTC_REQUEST_IDENTITIES (0x0b), length-prefixed.
+    let mut req = Vec::with_capacity(5);
+    req.extend_from_slice(&1u32.to_be_bytes()); // message length = 1
+    req.push(0x0b); // SSH2_AGENTC_REQUEST_IDENTITIES
+    stream
+        .write_all(&req)
+        .map_err(|_e| mux_core::error::MuxError::SshAgentNotForwarded)?;
+
+    // Read response: 4-byte length prefix, then body.
+    let mut len_buf = [0u8; 4];
+    stream
+        .read_exact(&mut len_buf)
+        .map_err(|_| mux_core::error::MuxError::SshAgentNotForwarded)?;
+    let resp_len = u32::from_be_bytes(len_buf) as usize;
+
+    let mut body = vec![0u8; resp_len];
+    stream
+        .read_exact(&mut body)
+        .map_err(|_| mux_core::error::MuxError::SshAgentNotForwarded)?;
+
+    // Parse SSH2_AGENT_IDENTITIES_ANSWER (0x0c).
+    if body.is_empty() || body[0] != 0x0c {
+        tracing::warn!(
+            "unexpected SSH agent response type: {}",
+            body.first().copied().unwrap_or(0)
+        );
+        return Ok(Vec::new());
+    }
+
+    let mut pos = 1usize;
+    let count = match read_u32_be(&body, &mut pos) {
+        Some(n) => n as usize,
+        None => return Ok(Vec::new()),
+    };
+
+    let mut keys = Vec::with_capacity(count);
+    for _ in 0..count {
+        let key_blob = match read_bytes(&body, &mut pos) {
+            Some(b) => b,
+            None => break,
+        };
+        let comment = match read_string(&body, &mut pos) {
+            Some(s) => s,
+            None => break,
+        };
+
+        // Extract algorithm name from the start of the key blob.
+        let algorithm = {
+            let mut kb_pos = 0usize;
+            read_string(&key_blob, &mut kb_pos).unwrap_or_default()
+        };
+
+        keys.push(AgentKey {
+            algorithm,
+            key_blob,
+            comment,
+        });
+    }
+
+    Ok(keys)
+}
+
+// ── Wire format helpers ───────────────────────────────────────────────────────
+
+fn read_u32_be(buf: &[u8], pos: &mut usize) -> Option<u32> {
+    if *pos + 4 > buf.len() {
+        return None;
+    }
+    let val = u32::from_be_bytes([buf[*pos], buf[*pos + 1], buf[*pos + 2], buf[*pos + 3]]);
+    *pos += 4;
+    Some(val)
+}
+
+fn read_bytes(buf: &[u8], pos: &mut usize) -> Option<Vec<u8>> {
+    let len = read_u32_be(buf, pos)? as usize;
+    if *pos + len > buf.len() {
+        return None;
+    }
+    let bytes = buf[*pos..*pos + len].to_vec();
+    *pos += len;
+    Some(bytes)
+}
+
+fn read_string(buf: &[u8], pos: &mut usize) -> Option<String> {
+    let bytes = read_bytes(buf, pos)?;
+    String::from_utf8(bytes).ok()
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mux_state::store::Store;
+    use tempfile::TempDir;
+
+    fn open_store() -> (TempDir, Store) {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("mux.db");
+        let store = Store::open(&db_path).unwrap();
+        (dir, store)
+    }
+
+    fn insert_host(conn: &rusqlite::Connection) -> i64 {
+        mux_state::host_repo::insert(conn, "test", "user", "127.0.0.1", 22, 1_000_000).unwrap()
+    }
+
+    // ── check_host_key ────────────────────────────────────────────────────────
+
+    #[test]
+    fn check_host_key_first_contact() {
+        let (_dir, store) = open_store();
+        let conn = store.conn();
+        let host_id = insert_host(conn);
+
+        let result = check_host_key(conn, host_id, "ssh-ed25519", "AAAA1234").unwrap();
+        assert_eq!(
+            result,
+            TrustCheckResult::FirstContact {
+                algorithm: "ssh-ed25519".into(),
+                fingerprint: "AAAA1234".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn check_host_key_trusted() {
+        let (_dir, store) = open_store();
+        let conn = store.conn();
+        let host_id = insert_host(conn);
+        fingerprint_repo::upsert(conn, host_id, "ssh-ed25519", "AAAA1234", 1_000_000).unwrap();
+
+        let result = check_host_key(conn, host_id, "ssh-ed25519", "AAAA1234").unwrap();
+        assert_eq!(result, TrustCheckResult::Trusted);
+    }
+
+    #[test]
+    fn check_host_key_mismatch() {
+        let (_dir, store) = open_store();
+        let conn = store.conn();
+        let host_id = insert_host(conn);
+        fingerprint_repo::upsert(conn, host_id, "ssh-ed25519", "AAAA1234", 1_000_000).unwrap();
+
+        let result = check_host_key(conn, host_id, "ssh-ed25519", "BBBB5678").unwrap();
+        assert_eq!(
+            result,
+            TrustCheckResult::Mismatch {
+                algorithm: "ssh-ed25519".into(),
+                stored: "AAAA1234".into(),
+                received: "BBBB5678".into(),
+            }
+        );
+    }
+
+    // ── trust_fingerprint ─────────────────────────────────────────────────────
+
+    #[test]
+    fn trust_fingerprint_stores_and_updates() {
+        let (_dir, store) = open_store();
+        let conn = store.conn();
+        let host_id = insert_host(conn);
+
+        trust_fingerprint(conn, host_id, "ssh-ed25519", "AAAA1234").unwrap();
+        let first = fingerprint_repo::get(conn, host_id, "ssh-ed25519")
+            .unwrap()
+            .expect("should exist after first trust");
+        assert_eq!(first.fingerprint, "AAAA1234");
+
+        trust_fingerprint(conn, host_id, "ssh-ed25519", "BBBB5678").unwrap();
+        let second = fingerprint_repo::get(conn, host_id, "ssh-ed25519")
+            .unwrap()
+            .expect("should exist after second trust");
+        assert_eq!(second.fingerprint, "BBBB5678", "second call should overwrite");
+    }
+
+    // ── preferred_fingerprint_for_attach ──────────────────────────────────────
+
+    fn make_fp(algorithm: &str, fingerprint: &str) -> mux_state::model::KnownHostFingerprint {
+        mux_state::model::KnownHostFingerprint {
+            id: 1,
+            host_id: 1,
+            algorithm: algorithm.to_owned(),
+            fingerprint: fingerprint.to_owned(),
+            trusted_at: 1_000_000,
+        }
+    }
+
+    #[test]
+    fn preferred_fingerprint_ed25519_first() {
+        let fps = vec![
+            make_fp("rsa-sha2-256", "RSA256FP"),
+            make_fp("ssh-ed25519", "ED25519FP"),
+        ];
+        let result = preferred_fingerprint_for_attach(&fps).expect("should return a fingerprint");
+        assert_eq!(result.algorithm, "ssh-ed25519");
+        assert_eq!(result.fingerprint, "ED25519FP");
+    }
+
+    #[test]
+    fn preferred_fingerprint_falls_back_to_arbitrary() {
+        let fps = vec![make_fp("x-unknown-algo", "UNKNOWNFP")];
+        let result = preferred_fingerprint_for_attach(&fps).expect("should return a fingerprint");
+        assert_eq!(result.algorithm, "x-unknown-algo");
+        assert_eq!(result.fingerprint, "UNKNOWNFP");
+    }
+
+    #[test]
+    fn preferred_fingerprint_empty_slice() {
+        let fps: Vec<mux_state::model::KnownHostFingerprint> = vec![];
+        assert!(preferred_fingerprint_for_attach(&fps).is_none());
+    }
+
+    // ── list_agent_keys ───────────────────────────────────────────────────────
+
+    #[test]
+    fn list_agent_keys_no_sock_var() {
+        // Point SSH_AUTH_SOCK to a nonexistent path so the connect fails.
+        // This exercises the same error path as a missing var.
+        std::env::set_var("SSH_AUTH_SOCK", "/nonexistent/path/agent.sock");
+        let result = list_agent_keys();
+        assert!(
+            matches!(result, Err(mux_core::error::MuxError::SshAgentNotForwarded)),
+            "expected SshAgentNotForwarded, got {result:?}"
+        );
+    }
 }
