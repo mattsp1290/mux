@@ -12,7 +12,7 @@ use mux_cli::create::{HostKeyInfo, SshHost};
 use mux_cli::kill::{KillContext, run_kill};
 use mux_core::error::MuxError;
 use mux_rpc::schema::{KillSessionResponse, RpcError, RpcResult};
-use mux_state::session_repo::{activate, set_status, ReserveParams};
+use mux_state::session_repo::{activate, ReserveParams};
 use mux_state::{host_repo, session_repo};
 use mux_state::store::Store;
 use tempfile::TempDir;
@@ -377,9 +377,6 @@ async fn kill_tofu_mismatch_never_reaches_rpc() {
     let (_dir, store) = open_store();
     let conn = store.conn();
     let host_id = insert_host_with_home(conn);
-    let uuid = "abababab-abab-abab-abab-ababababababab";
-
-    // UUID has to be valid 36-char format
     let uuid = "abababab-abab-abab-abab-abababababab";
     insert_active_session(conn, host_id, uuid, "mismatchapp2", "owner/repo", false);
     // Trust "STORED_FP" but SSH will return "DIFFERENT_FP"
