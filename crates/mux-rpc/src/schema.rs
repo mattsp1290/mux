@@ -5,12 +5,13 @@
 //! Wire format: [u32 LE length][UTF-8 JSON body]
 //! Requests carry an "op" tag for operation dispatch.
 
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 // ── Health ────────────────────────────────────────────────────────────────────
 
 /// Braced-struct form: serialises to `{}` (not `null`), forward-compatible.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HealthRequest {}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -21,6 +22,7 @@ pub struct HealthResponse {
 // ── CreateSession ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateSessionRequest {
     pub uuid: String,
     pub shortname: String,
@@ -40,6 +42,7 @@ pub struct CreateSessionResponse {
 // ── ListSessions ──────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ListSessionsRequest {}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -47,6 +50,7 @@ pub struct SessionInfo {
     pub uuid: String,
     pub shortname: String,
     pub tmux_name: String,
+    // Non-optional: the agent only lists sessions it created/imported, both of which have a workdir.
     pub workdir: String,
     pub status: SessionStatusValue,
 }
@@ -59,6 +63,7 @@ pub struct ListSessionsResponse {
 // ── GetSession ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GetSessionRequest {
     pub uuid: String,
 }
@@ -74,6 +79,7 @@ pub struct GetSessionResponse {
 // ── KillSession ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct KillSessionRequest {
     pub uuid: String,
     pub repo_slug: String,
@@ -88,6 +94,7 @@ pub struct KillSessionResponse {
 // ── Shutdown ──────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ShutdownRequest {}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -96,6 +103,7 @@ pub struct ShutdownResponse {}
 // ── StreamSessionEvents (unimplemented in v0.1) ───────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StreamSessionEventsRequest {}
 
 // No StreamSessionEventsResponse: always returns RpcError { error: "internal", message: "streaming not implemented" }
@@ -188,16 +196,35 @@ pub enum Request {
 
 /// A response that may be either the expected type T or an RpcError.
 ///
-/// Serialised with untagged representation: T fields appear directly, or
-/// `{ "error": "...", "message": "..." }` for errors.
+/// Wire format: T's fields appear at the top level, or `{ "error": "...", "message": "..." }`.
+/// The `"error"` key is the discriminator: its presence means an error response.
 ///
-/// IMPORTANT: T must not have an `"error"` field or the untagged discrimination
-/// will be ambiguous. All current response types satisfy this constraint.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Uses a custom Deserialize that peeks for `"error"` before attempting T, so even
+/// fieldless T (e.g. `ShutdownResponse {}`) cannot silently absorb an error payload.
+/// Serialize remains untagged so the wire format is unchanged.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum RpcResult<T> {
     Ok(T),
     Err(RpcError),
+}
+
+impl<'de, T: DeserializeOwned> Deserialize<'de> for RpcResult<T> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        if value.get("error").is_some() {
+            RpcError::deserialize(value)
+                .map(RpcResult::Err)
+                .map_err(serde::de::Error::custom)
+        } else {
+            T::deserialize(value)
+                .map(RpcResult::Ok)
+                .map_err(serde::de::Error::custom)
+        }
+    }
 }
 
 impl<T> RpcResult<T> {
@@ -363,5 +390,26 @@ mod tests {
             1,
             "shutdown request should only have the op tag"
         );
+    }
+
+    // Regression: fieldless ShutdownResponse must not silently absorb an error payload.
+    // Prior to the custom Deserialize, untagged tried Ok(T) first and ShutdownResponse {}
+    // accepted any JSON object, swallowing {"error": ...} as a false success.
+    #[test]
+    fn rpc_result_shutdown_error_not_swallowed() {
+        let json = r#"{"error":"internal","message":"something went wrong"}"#;
+        let result: RpcResult<ShutdownResponse> = serde_json::from_str(json).unwrap();
+        assert!(
+            result.into_result().is_err(),
+            "error body must decode as Err, not be swallowed as Ok(ShutdownResponse {{}})"
+        );
+    }
+
+    #[test]
+    fn rpc_result_shutdown_ok_still_works() {
+        let result: RpcResult<ShutdownResponse> = RpcResult::Ok(ShutdownResponse {});
+        let json = serde_json::to_string(&result).unwrap();
+        let decoded: RpcResult<ShutdownResponse> = serde_json::from_str(&json).unwrap();
+        assert!(decoded.into_result().is_ok());
     }
 }

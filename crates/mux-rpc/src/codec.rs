@@ -100,6 +100,27 @@ mod tests {
         assert_eq!(val, decoded);
     }
 
+    #[test]
+    fn decode_malformed_json_returns_error() {
+        let bad = b"not valid json {{{";
+        let result: Result<serde_json::Value, _> = decode(bad);
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn eof_mid_message_returns_error() {
+        // Write a valid length header claiming 10 bytes, but drop before writing body.
+        let (mut write_half, mut read_half) = tokio::io::duplex(64);
+        let len_bytes: [u8; 4] = 10u32.to_le_bytes();
+        write_half.write_all(&len_bytes).await.unwrap();
+        drop(write_half); // EOF with body bytes missing
+        let result = read_message(&mut read_half).await;
+        assert!(
+            result.is_err(),
+            "mid-message EOF must be an error, not Ok(None)"
+        );
+    }
+
     #[tokio::test]
     async fn empty_body_roundtrip() {
         let (mut write_half, mut read_half) = tokio::io::duplex(64);
