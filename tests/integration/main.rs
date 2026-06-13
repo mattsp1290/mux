@@ -1,19 +1,21 @@
-// Integration test entry point (scaffold — not yet wired into Cargo).
+// Integration test entry point.
 //
-// This file and harness.rs document the planned test structure.
-// When the first integration test module is written (mux-av5, mux-zpx, mux-qz4),
-// a dedicated integration test crate will be added to the workspace with a
-// [features] integration-tests gate and a [[test]] entry pointing here.
+// Gated behind the `integration-tests` feature:
+//   cargo test -p mux-integration-tests --test integration --features integration-tests -- --test-threads=1
 //
-// Tests will be skipped automatically if Docker is unavailable.
+// Tests that require Docker use the require_docker!() macro to skip gracefully
+// on runners without Docker. The primary skip mechanism is the feature gate
+// itself — without `--features integration-tests`, this crate is never compiled.
+//
 // See prompts/docs/integration-tests.md for the full environment plan.
 
 mod harness;
 
-// Test modules — each file corresponds to a mux command group.
-// All tests are #[ignore] stubs until the integration crate is wired up (mux-qz4).
-//
-//   mod init;      (mux-3bv follow-on)
-mod host;     // mux-av5: host test/trust scenarios
-mod agent;    // mux-zpx: deploy/logs/stop scenarios
-//   mod session;   (mux-qz4)
+// `init` tests do not require Docker — safe to run anywhere.
+mod init;
+
+// All other modules require Docker. Use --test-threads=1 when running them
+// because tests share fixed-port Docker container services.
+mod agent;   // mux agent deploy / logs / stop
+mod host;    // mux host test / trust
+mod session; // mux create / list / status / attach / kill
