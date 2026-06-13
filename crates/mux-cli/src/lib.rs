@@ -5,6 +5,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::generate;
 
 pub mod agent_start;
+pub mod attach;
 pub mod create;
 pub mod host;
 pub mod kill;
@@ -48,7 +49,10 @@ pub enum Command {
         branch: Option<String>,
     },
     /// Attach to an existing session
-    Attach,
+    Attach {
+        /// UUID or shortname of the session to attach
+        selector: String,
+    },
     /// List sessions
     List,
     /// Show session status
@@ -129,7 +133,8 @@ pub async fn run(command: Command, mux_home: PathBuf) -> Result<()> {
         // TODO: wire to run_create once a real SshHost SSH impl lands (currently
         // no production SSH executor exists; the create module is tested in isolation).
         Command::Create { .. } => anyhow::bail!("mux create: SSH execution not yet implemented"),
-        Command::Attach => todo!("mux attach"),
+        // TODO: wire to prepare_attach + exec once a real SshHost SSH impl lands.
+        Command::Attach { .. } => anyhow::bail!("mux attach: SSH execution not yet implemented"),
         Command::List => todo!("mux list"),
         Command::Status => todo!("mux status"),
         // TODO: wire to run_kill once a real SshHost SSH impl lands (currently no
