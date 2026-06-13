@@ -493,6 +493,7 @@ dependencies = [
  "mux-state",
  "predicates",
  "serde",
+ "tempfile",
  "tokio",
  "tracing",
 ]

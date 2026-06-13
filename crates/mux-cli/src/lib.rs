@@ -73,7 +73,7 @@ pub enum AgentAction {
     Stop,
 }
 
-pub async fn run(command: Command, _mux_home: PathBuf) -> Result<()> {
+pub async fn run(command: Command, mux_home: PathBuf) -> Result<()> {
     match command {
         Command::Completions { shell } => {
             let mut cmd = Cli::command();
@@ -81,7 +81,11 @@ pub async fn run(command: Command, _mux_home: PathBuf) -> Result<()> {
             generate(shell, &mut cmd, &name, &mut std::io::stdout());
             Ok(())
         }
-        Command::Init => todo!("mux init"),
+        Command::Init => {
+            let db_path = mux_home.join("mux.db");
+            mux_state::store::Store::open(&db_path)?;
+            Ok(())
+        }
         Command::Host { .. } => todo!("mux host"),
         Command::Agent { .. } => todo!("mux agent"),
         Command::Create => todo!("mux create"),
@@ -89,5 +93,66 @@ pub async fn run(command: Command, _mux_home: PathBuf) -> Result<()> {
         Command::List => todo!("mux list"),
         Command::Status => todo!("mux status"),
         Command::Kill => todo!("mux kill"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn init_creates_state_directory_and_db() {
+        let tmp = TempDir::new().unwrap();
+        let mux_home = tmp.path().join(".mux");
+        run(Command::Init, mux_home.clone()).await.unwrap();
+        assert!(mux_home.exists(), "mux_home should be created");
+        assert!(mux_home.join("mux.db").exists(), "mux.db should be created");
+    }
+
+    #[tokio::test]
+    async fn init_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let mux_home = tmp.path().join(".mux");
+        run(Command::Init, mux_home.clone()).await.unwrap();
+        run(Command::Init, mux_home.clone()).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn init_sets_private_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let mux_home = tmp.path().join(".mux");
+        run(Command::Init, mux_home.clone()).await.unwrap();
+        let dir_mode = std::fs::metadata(&mux_home).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700, "mux_home should be 0700, got {dir_mode:o}");
+        let db_mode = std::fs::metadata(mux_home.join("mux.db"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(db_mode, 0o600, "mux.db should be 0600, got {db_mode:o}");
+    }
+
+    #[tokio::test]
+    async fn init_creates_no_config_file() {
+        let tmp = TempDir::new().unwrap();
+        let mux_home = tmp.path().join(".mux");
+        run(Command::Init, mux_home.clone()).await.unwrap();
+        let entries: Vec<_> = std::fs::read_dir(&mux_home)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let name = e.file_name();
+                let s = name.to_string_lossy();
+                // Only mux.db and WAL sidecars should exist; no config files
+                !s.starts_with("mux.db")
+            })
+            .collect();
+        assert!(
+            entries.is_empty(),
+            "no config file should be created by init; found: {entries:?}"
+        );
     }
 }
