@@ -618,6 +618,56 @@ mod tests {
         assert_eq!(count, 0, "fingerprints should be cascade-deleted");
     }
 
+    // ── add validation edge cases ─────────────────────────────────────────────
+
+    #[test]
+    fn add_empty_user_errors() {
+        let (_dir, store) = open_store();
+        let conn = store.conn();
+        let err = cmd_add(conn, "myhost".to_owned(), "@10.0.0.1".to_owned(), 22).unwrap_err();
+        // Use "user part" not just "user" — both messages contain "user@addr" as a substring.
+        assert!(err.to_string().contains("user part"), "got: {err}");
+    }
+
+    #[test]
+    fn add_empty_addr_errors() {
+        let (_dir, store) = open_store();
+        let conn = store.conn();
+        let err = cmd_add(conn, "myhost".to_owned(), "user@".to_owned(), 22).unwrap_err();
+        // Use "addr part" not just "addr" — both messages contain "user@addr" as a substring.
+        assert!(err.to_string().contains("addr part"), "got: {err}");
+    }
+
+    // ── list: multiple hosts ──────────────────────────────────────────────────
+
+    #[test]
+    fn list_multiple_hosts_does_not_error() {
+        let (_dir, store) = open_store();
+        let conn = store.conn();
+        cmd_add(conn, "alpha".to_owned(), "alice@10.0.0.1".to_owned(), 22).unwrap();
+        cmd_add(conn, "beta".to_owned(), "bob@10.0.0.2".to_owned(), 2222).unwrap();
+        // Verify cmd_list doesn't error with multiple hosts in the table.
+        cmd_list(conn).unwrap();
+        let hosts = host_repo::list(conn).unwrap();
+        assert_eq!(hosts.len(), 2, "both hosts should be in inventory");
+    }
+
+    // ── remove: confirmation decline ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn remove_no_confirmation_aborts_without_removing() {
+        let (_dir, store) = open_store();
+        let conn = store.conn();
+        cmd_add(conn, "keephost".to_owned(), "user@10.0.0.7".to_owned(), 22).unwrap();
+        // yes=false; cargo test provides empty/EOF stdin so read_line returns "" →
+        // trimmed != "y" → abort path taken. Same convention as cmd_trust_mismatch_declined.
+        cmd_remove(conn, "keephost".to_owned(), false).await.unwrap();
+        let host = host_repo::get_by_alias(conn, "keephost").unwrap();
+        assert!(host.is_some(), "host should still exist after declined confirmation");
+        let all = host_repo::list(conn).unwrap();
+        assert_eq!(all.len(), 1, "no other rows should have been deleted");
+    }
+
     // ── new: preflight parsing ────────────────────────────────────────────────
 
     #[test]
