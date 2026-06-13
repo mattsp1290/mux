@@ -45,14 +45,14 @@ Implementation beads cite this index to find the canonical section for each requ
 
 | File | Status | Created by |
 |---|---|---|
-| `clean-room-guardrails.md` | pending | mux-ii3 |
-| `cli-contract.md` | pending | mux-pre |
-| `sqlite-state.md` | pending | mux-8ep |
+| `clean-room-guardrails.md` | done | mux-ii3 |
+| `cli-contract.md` | done | mux-pre |
+| `sqlite-state.md` | done | mux-8ep |
 | `ssh-transport.md` | pending | mux-7nr |
-| `stack-validation.md` | pending | mux-a2b |
+| `stack-validation.md` | done | mux-a2b |
 | `rpc-protocol.md` | pending | mux-2n5 |
-| `tmux-contract.md` | pending | mux-14j |
-| `session-flows.md` | pending | mux-s66 |
+| `tmux-contract.md` | done | mux-14j |
+| `session-flows.md` | done | mux-s66 |
 | `release.md` | pending | mux-7ng |
 | `integration-tests.md` | pending | mux-3bv |
 | `spec-audit.md` | pending | mux-0h0 |
