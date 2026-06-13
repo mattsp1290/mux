@@ -203,7 +203,8 @@ mod tests {
         let db_path = dir.path().join("mux.db");
         let store1 = Store::open(&db_path).unwrap();
         let store2 = Store::open(&db_path).unwrap();
-        // WAL mode allows concurrent readers; both connections can query.
+        // Both connections open and read successfully (verifies Store::open is not
+        // exclusive and WAL sidecar files are handled correctly).
         let n1: i64 = store1
             .conn()
             .query_row("SELECT COUNT(*) FROM hosts", [], |r| r.get(0))
@@ -222,13 +223,21 @@ mod tests {
         let db_path = dir.path().join("mux.db");
         let store1 = Store::open(&db_path).unwrap();
         let store2 = Store::open(&db_path).unwrap();
-        crate::host_repo::insert(store1.conn(), "concurrent-host", "u", "1.2.3.4", 22, 1_000_000)
-            .unwrap();
-        // Committed writes by store1 are visible to store2's next read transaction.
+        // host_repo::insert runs a single autocommit INSERT on store1.
+        crate::host_repo::insert(store1.conn(), "host-a", "u", "1.2.3.4", 22, 1_000_000).unwrap();
+        // Each bare SELECT is its own implicit read transaction starting after the
+        // INSERT commits; WAL mode makes the write visible immediately to store2.
         let n: i64 = store2
             .conn()
             .query_row("SELECT COUNT(*) FROM hosts", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(n, 1, "write on store1 should be visible via store2");
+        assert_eq!(n, 1, "committed write on store1 should be visible via store2");
+        // Symmetric: write on store2 is visible to store1.
+        crate::host_repo::insert(store2.conn(), "host-b", "u", "2.3.4.5", 22, 1_000_001).unwrap();
+        let n2: i64 = store1
+            .conn()
+            .query_row("SELECT COUNT(*) FROM hosts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n2, 2, "committed write on store2 should be visible via store1");
     }
 }

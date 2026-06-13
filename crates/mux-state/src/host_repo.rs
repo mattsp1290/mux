@@ -154,9 +154,9 @@ mod tests {
         let conn = store.conn();
         let id = insert(conn, "freshhost", "u", "1.2.3.4", 22, 1_000_000).unwrap();
         let host = get_by_id(conn, id).unwrap().unwrap();
-        assert!(host.arch.is_none(), "arch should be NULL until host test runs");
-        assert!(host.home.is_none(), "home should be NULL until host test runs");
-        assert!(host.transport.is_none(), "transport should be NULL until host test runs");
+        assert!(host.arch.is_none(), "arch should be NULL on a freshly inserted host");
+        assert!(host.home.is_none(), "home should be NULL on a freshly inserted host");
+        assert!(host.transport.is_none(), "transport should be NULL on a freshly inserted host");
     }
 
     #[test]
