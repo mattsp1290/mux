@@ -83,8 +83,7 @@ pub async fn run(command: Command, mux_home: PathBuf) -> Result<()> {
         }
         Command::Init => {
             let db_path = mux_home.join("mux.db");
-            mux_state::store::Store::open(&db_path)
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            mux_state::store::Store::open(&db_path)?;
             Ok(())
         }
         Command::Host { .. } => todo!("mux host"),
