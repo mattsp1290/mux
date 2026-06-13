@@ -94,17 +94,22 @@ The agent:
 
 ```
 Request:  {}
-Response: [
-  {
-    "uuid":      "<v4 UUID>",
-    "shortname": "<shortname>",
-    "tmux_name": "mux-<shortname>",
-    "workdir":   "<absolute path>",
-    "status":    "active" | "dead" | "unreachable" | "orphaned"
-  },
-  ...
-]
+Response: {
+  "sessions": [
+    {
+      "uuid":      "<v4 UUID>",
+      "shortname": "<shortname>",
+      "tmux_name": "mux-<shortname>",
+      "workdir":   "<absolute path>",
+      "status":    "active" | "dead" | "unreachable" | "orphaned"
+    },
+    ...
+  ]
+}
 ```
+
+The array is wrapped in a `sessions` key (not a bare top-level array) to allow
+future extension with pagination or metadata fields without a breaking change.
 
 Returns all sessions in the agent's ownership map that still exist as tmux sessions.
 Sessions whose tmux session no longer exists are reported as `dead`.
