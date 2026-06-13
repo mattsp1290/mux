@@ -340,6 +340,18 @@ pub enum TransportMode {
     Tcp,
 }
 
+impl std::str::FromStr for TransportMode {
+    type Err = MuxError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "streamlocal" => Ok(Self::Streamlocal),
+            "tcp" => Ok(Self::Tcp),
+            _ => Err(MuxError::InvalidForceTransport(s.to_owned())),
+        }
+    }
+}
+
 /// Session lifecycle status stored in local SQLite.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -486,6 +498,16 @@ mod tests {
     fn session_status_from_str_rejects_unknown() {
         assert!("unknown".parse::<SessionStatus>().is_err());
         assert!("Active".parse::<SessionStatus>().is_err());
+    }
+
+    #[test]
+    fn transport_mode_from_str() {
+        assert_eq!("streamlocal".parse::<TransportMode>().unwrap(), TransportMode::Streamlocal);
+        assert_eq!("tcp".parse::<TransportMode>().unwrap(), TransportMode::Tcp);
+        assert!(matches!(
+            "invalid".parse::<TransportMode>(),
+            Err(MuxError::InvalidForceTransport(s)) if s == "invalid"
+        ));
     }
 
     #[test]

@@ -131,6 +131,11 @@ pub enum MuxError {
     #[error("host key rejected by user")]
     HostKeyRejected,
 
+    /// MUX_FORCE_TRANSPORT env var has an invalid value.
+    /// Hint: "Valid values are 'streamlocal' and 'tcp'."
+    #[error("invalid MUX_FORCE_TRANSPORT value: {0:?}; expected 'streamlocal' or 'tcp'")]
+    InvalidForceTransport(String),
+
     /// The remote mux-agent returned an application-level error.
     #[error("agent error: {0}")]
     AgentError(String),
@@ -170,6 +175,9 @@ impl MuxError {
             MuxError::HostKeyRejected => {
                 Some("Trust the host first with `mux host test <alias>`.")
             }
+            MuxError::InvalidForceTransport(_) => {
+                Some("Valid values are 'streamlocal' and 'tcp'.")
+            }
             _ => None,
         }
     }
@@ -189,6 +197,7 @@ impl MuxError {
             MuxError::SessionAlreadyExists { .. } => "session_already_exists",
             MuxError::ShortnameExhausted => "shortname_exhausted",
             MuxError::RpcError(_) | MuxError::AgentError(_) => "rpc_error",
+            MuxError::InvalidForceTransport(_) => "invalid_force_transport",
             MuxError::Other(_) => "other",
             // Remaining variants: user-input or host errors without a dedicated spec category.
             _ => "other",
@@ -219,7 +228,8 @@ impl MuxError {
             | MuxError::TofuNonInteractive
             | MuxError::HostKeyRejected
             | MuxError::AgentError(_)
-            | MuxError::RpcError(_) => 1,
+            | MuxError::RpcError(_)
+            | MuxError::InvalidForceTransport(_) => 1,
             MuxError::Other(_) => 2,
         }
     }
