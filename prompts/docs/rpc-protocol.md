@@ -159,7 +159,7 @@ sessions after `Shutdown` is received.
 
 ```
 Request:  {}
-Response: UNIMPLEMENTED in v0.1 — return an error response.
+Response: UNIMPLEMENTED in v0.1 — return { "error": "internal", "message": "streaming not implemented" }.
 ```
 
 ### Error response format
@@ -169,7 +169,15 @@ All operations may return an error response:
 { "error": "<error_key>", "message": "<human-readable detail>" }
 ```
 
-Defined error keys: `not_owned`, `not_found`, `tmux_error`, `internal`.
+Defined error keys:
+
+| Key | Source |
+|-----|--------|
+| `not_owned` | `KillSession` — uuid not in ownership map |
+| `not_found` | `GetSession` — uuid unknown |
+| `tmux_error` | Any operation where tmux command fails |
+| `internal` | Unexpected errors; also returned for unimplemented operations |
+| `agent_start_timeout` | Client-side, pre-connection: agent did not become ready within 60s |
 
 ## Agent ownership model
 

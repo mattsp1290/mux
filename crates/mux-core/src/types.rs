@@ -112,15 +112,59 @@ impl Default for Port {
     }
 }
 
+impl TryFrom<u16> for Port {
+    type Error = MuxError;
+
+    fn try_from(n: u16) -> Result<Self, Self::Error> {
+        if n == 0 {
+            Err(MuxError::InvalidPort(n.to_string()))
+        } else {
+            Ok(Port(n))
+        }
+    }
+}
+
 /// A remote SSH endpoint in `user@addr` form.
 ///
 /// `user` is a Unix username (no `@`). `addr` is a hostname or IP address (no `@`).
 /// The spec (docs/01 §mux host add) does not specify further constraints on username
-/// or address format; validation is conservative (non-empty, no `@` in either component).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// or address format; validation is conservative (non-empty, no `@` in addr component).
+/// Serializes/deserializes as a flat `"user@addr"` string, consistent with `Display`.
+/// Argv-safety constraints (e.g., leading hyphens) are enforced at the SSH invocation
+/// layer, not here.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Endpoint {
-    pub user: String,
-    pub addr: String,
+    user: String,
+    addr: String,
+}
+
+impl Endpoint {
+    pub fn user(&self) -> &str {
+        &self.user
+    }
+
+    pub fn addr(&self) -> &str {
+        &self.addr
+    }
+}
+
+impl Serialize for Endpoint {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for Endpoint {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        s.parse().map_err(serde::de::Error::custom)
+    }
 }
 
 impl std::str::FromStr for Endpoint {
@@ -130,7 +174,7 @@ impl std::str::FromStr for Endpoint {
         let mut parts = s.splitn(2, '@');
         let user = parts.next().unwrap_or("").to_owned();
         let addr = parts.next().unwrap_or("").to_owned();
-        if user.is_empty() || addr.is_empty() || user.contains('@') || addr.contains('@') {
+        if user.is_empty() || addr.is_empty() || addr.contains('@') {
             return Err(MuxError::InvalidEndpoint(s.to_owned()));
         }
         Ok(Endpoint { user, addr })
@@ -380,15 +424,15 @@ mod tests {
     #[test]
     fn endpoint_valid() {
         let ep: Endpoint = "alice@192.168.1.1".parse().unwrap();
-        assert_eq!(ep.user, "alice");
-        assert_eq!(ep.addr, "192.168.1.1");
+        assert_eq!(ep.user(), "alice");
+        assert_eq!(ep.addr(), "192.168.1.1");
     }
 
     #[test]
     fn endpoint_valid_hostname() {
         let ep: Endpoint = "bob@host.example.com".parse().unwrap();
-        assert_eq!(ep.user, "bob");
-        assert_eq!(ep.addr, "host.example.com");
+        assert_eq!(ep.user(), "bob");
+        assert_eq!(ep.addr(), "host.example.com");
     }
 
     #[test]
@@ -416,8 +460,35 @@ mod tests {
 
     #[test]
     fn endpoint_rejects_multiple_at() {
-        // Only the first @ is the user/addr separator; a second @ in user is impossible
-        // given splitn(2), but addr containing @ must be rejected.
         assert!("alice@host@extra".parse::<Endpoint>().is_err());
+    }
+
+    #[test]
+    fn endpoint_serde_roundtrip() {
+        let ep: Endpoint = "alice@192.168.1.1".parse().unwrap();
+        let json = serde_json::to_string(&ep).unwrap();
+        assert_eq!(json, r#""alice@192.168.1.1""#);
+        let back: Endpoint = serde_json::from_str(&json).unwrap();
+        assert_eq!(ep, back);
+    }
+
+    #[test]
+    fn endpoint_deserialize_rejects_invalid() {
+        assert!(serde_json::from_str::<Endpoint>(r#""noatsign""#).is_err());
+        assert!(serde_json::from_str::<Endpoint>(r#""@addr""#).is_err());
+        assert!(serde_json::from_str::<Endpoint>(r#""user@""#).is_err());
+    }
+
+    #[test]
+    fn port_serde_rejects_above_max() {
+        assert!(serde_json::from_str::<Port>("65536").is_err());
+        assert!(serde_json::from_str::<Port>(r#""65536""#).is_err());
+    }
+
+    #[test]
+    fn port_try_from_u16() {
+        assert_eq!(Port::try_from(22u16).unwrap().value(), 22);
+        assert_eq!(Port::try_from(65535u16).unwrap().value(), 65535);
+        assert!(Port::try_from(0u16).is_err());
     }
 }
