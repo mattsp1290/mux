@@ -293,6 +293,9 @@ fn display_all(conn: &Connection, hosts: &[Host], plain: bool) -> Result<()> {
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
+//
+// White-box unit tests only — scenarios requiring access to private symbols.
+// Public-API reconciliation contract tests live in `tests/list.rs`.
 
 #[cfg(test)]
 mod tests {
@@ -303,8 +306,6 @@ mod tests {
     use mux_state::session_repo::{activate, ReserveParams};
     use mux_state::store::Store;
     use tempfile::TempDir;
-
-    // ── MockRemoteExec ────────────────────────────────────────────────────────
 
     struct MockExec {
         responses: RefCell<VecDeque<(i32, String, String)>>,
@@ -328,8 +329,6 @@ mod tests {
                 .ok_or_else(|| MuxError::Other(anyhow::anyhow!("SSH unreachable (mock)")))
         }
     }
-
-    // ── Helpers ───────────────────────────────────────────────────────────────
 
     fn open_store() -> (TempDir, Store) {
         let dir = TempDir::new().unwrap();
@@ -366,8 +365,7 @@ mod tests {
         ListContext { conn, make_exec, plain }
     }
 
-    // ── agent_status_str ──────────────────────────────────────────────────────
-
+    // Private function: maps all SessionStatusValue variants to their DB strings.
     #[test]
     fn agent_status_str_all_variants() {
         assert_eq!(agent_status_str(&SessionStatusValue::Active), "active");
@@ -376,104 +374,12 @@ mod tests {
         assert_eq!(agent_status_str(&SessionStatusValue::Orphaned), "orphaned");
     }
 
-    // ── unreachable host ──────────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn list_unreachable_host_marks_active_sessions_unreachable() {
-        let (_dir, store) = open_store();
-        let conn = store.conn();
-        let host_id = insert_host(conn);
-        let uuid = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
-        insert_active_session(conn, host_id, uuid, "myapp");
-
-        run_list(make_ctx(conn, |_| MockExec::unreachable(), false))
-            .await
-            .unwrap();
-
-        let s = session_repo::get_by_uuid(conn, uuid).unwrap().unwrap();
-        assert_eq!(s.status, "unreachable");
-    }
-
-    #[tokio::test]
-    async fn list_unreachable_host_leaves_unreachable_sessions_unchanged() {
-        let (_dir, store) = open_store();
-        let conn = store.conn();
-        let host_id = insert_host(conn);
-        let uuid = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
-        insert_active_session(conn, host_id, uuid, "myapp2");
-        session_repo::set_status(conn, uuid, "unreachable", 2_000_000).unwrap();
-
-        run_list(make_ctx(conn, |_| MockExec::unreachable(), false))
-            .await
-            .unwrap();
-
-        let s = session_repo::get_by_uuid(conn, uuid).unwrap().unwrap();
-        assert_eq!(s.status, "unreachable", "unreachable must stay unreachable");
-    }
-
-    #[tokio::test]
-    async fn list_unreachable_host_skips_orphaned_sessions() {
-        let (_dir, store) = open_store();
-        let conn = store.conn();
-        let host_id = insert_host(conn);
-        let uuid = "cccccccc-cccc-cccc-cccc-cccccccccccc";
-        insert_active_session(conn, host_id, uuid, "myapp3");
-        session_repo::set_status(conn, uuid, "orphaned", 2_000_000).unwrap();
-
-        run_list(make_ctx(conn, |_| MockExec::unreachable(), false))
-            .await
-            .unwrap();
-
-        let s = session_repo::get_by_uuid(conn, uuid).unwrap().unwrap();
-        assert_eq!(s.status, "orphaned", "orphaned must not be changed on unreachable host");
-    }
-
-    // ── no agent running ──────────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn list_no_agent_marks_active_sessions_unreachable() {
-        let (_dir, store) = open_store();
-        let conn = store.conn();
-        let host_id = insert_host(conn);
-        let uuid = "dddddddd-dddd-dddd-dddd-dddddddddddd";
-        insert_active_session(conn, host_id, uuid, "myapp4");
-
-        // probe_existing: read_lock returns empty → NoAgent
-        run_list(make_ctx(conn, |_| MockExec::new(vec![(0, String::new(), String::new())]), false))
-            .await
-            .unwrap();
-
-        let s = session_repo::get_by_uuid(conn, uuid).unwrap().unwrap();
-        assert_eq!(s.status, "unreachable");
-    }
-
-    // ── dead session skipping ─────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn list_does_not_resurface_dead_sessions() {
-        let (_dir, store) = open_store();
-        let conn = store.conn();
-        let host_id = insert_host(conn);
-        let uuid = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee";
-        insert_active_session(conn, host_id, uuid, "deadapp");
-        session_repo::set_status(conn, uuid, "dead", 2_000_000).unwrap();
-
-        // Even if SSH fails, dead sessions must stay dead
-        run_list(make_ctx(conn, |_| MockExec::unreachable(), false))
-            .await
-            .unwrap();
-
-        let s = session_repo::get_by_uuid(conn, uuid).unwrap().unwrap();
-        assert_eq!(s.status, "dead");
-    }
-
-    // ── host not yet probed (home is None) ────────────────────────────────────
-
+    // White-box: host with home=None (never probed) causes active sessions → unreachable.
+    // Not coverable in tests/list.rs because insert_host always calls update_probe.
     #[tokio::test]
     async fn list_host_not_probed_marks_active_unreachable() {
         let (_dir, store) = open_store();
         let conn = store.conn();
-        // Insert host WITHOUT update_probe (home stays None)
         let host_id = host_repo::insert(conn, "rawhost", "u", "192.0.2.2", 22, 1_000_000).unwrap();
         let uuid = "ffffffff-ffff-ffff-ffff-ffffffffffff";
         insert_active_session(conn, host_id, uuid, "rawapp");
@@ -486,247 +392,21 @@ mod tests {
         assert_eq!(s.status, "unreachable");
     }
 
-    // ── plain flag produces output ────────────────────────────────────────────
-
+    // White-box: agent.lock returns empty string (agent not running) → active → unreachable.
+    // The response pattern (exit 0, empty stdout) exercises the NoAgent branch in probe_existing.
     #[tokio::test]
-    async fn list_plain_flag_accepted() {
+    async fn list_no_agent_marks_active_sessions_unreachable() {
         let (_dir, store) = open_store();
         let conn = store.conn();
-        // No sessions; just confirm plain=true doesn't panic
-        run_list(make_ctx(conn, |_| MockExec::unreachable(), true))
+        let host_id = insert_host(conn);
+        let uuid = "dddddddd-dddd-dddd-dddd-dddddddddddd";
+        insert_active_session(conn, host_id, uuid, "myapp4");
+
+        run_list(make_ctx(conn, |_| MockExec::new(vec![(0, String::new(), String::new())]), false))
             .await
             .unwrap();
-    }
-
-    // ── no sessions ───────────────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn list_no_sessions_succeeds() {
-        let (_dir, store) = open_store();
-        let conn = store.conn();
-        run_list(make_ctx(conn, |_| MockExec::unreachable(), false))
-            .await
-            .unwrap();
-    }
-
-    // ── live RPC path ─────────────────────────────────────────────────────────
-
-    use mux_rpc::schema::{ListSessionsResponse, RpcResult, SessionInfo as RpcSessionInfo};
-    use tokio::io::AsyncWriteExt;
-    use tokio::net::TcpListener;
-
-    fn encode_list_response(sessions: Vec<RpcSessionInfo>) -> Vec<u8> {
-        let result: RpcResult<ListSessionsResponse> =
-            RpcResult::Ok(ListSessionsResponse { sessions });
-        let body = mux_rpc::codec::encode(&result).unwrap();
-        let mut frame = Vec::with_capacity(4 + body.len());
-        frame.extend_from_slice(&(body.len() as u32).to_le_bytes());
-        frame.extend_from_slice(&body);
-        frame
-    }
-
-    async fn spawn_list_server(response_frame: Vec<u8>) -> u16 {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            if let Ok((mut stream, _)) = listener.accept().await {
-                use tokio::io::AsyncReadExt;
-                let mut len_buf = [0u8; 4];
-                if stream.read_exact(&mut len_buf).await.is_ok() {
-                    let body_len = u32::from_le_bytes(len_buf) as usize;
-                    let mut body = vec![0u8; body_len];
-                    let _ = stream.read_exact(&mut body).await;
-                }
-                let _ = stream.write_all(&response_frame).await;
-            }
-        });
-        port
-    }
-
-    fn lock_json(port: u16) -> String {
-        format!(r#"{{"pid":99999,"tcp_url":"tcp://127.0.0.1:{port}"}}"#)
-    }
-
-    fn agent_running_responses(port: u16) -> Vec<(i32, String, String)> {
-        // [0] → `cat agent.lock` returns the lock JSON
-        // [1] → `kill -0 <pid>` returns exit 0 (process alive)
-        vec![(0, lock_json(port), String::new()), (0, String::new(), String::new())]
-    }
-
-    fn make_session_info(uuid: &str, shortname: &str, status: SessionStatusValue) -> RpcSessionInfo {
-        RpcSessionInfo {
-            uuid: uuid.to_owned(),
-            shortname: shortname.to_owned(),
-            tmux_name: format!("mux-{shortname}"),
-            workdir: format!("/work/{shortname}"),
-            status,
-        }
-    }
-
-    #[tokio::test]
-    async fn list_missing_active_session_marked_orphaned() {
-        // DB has active session; agent ran but didn't include its UUID → orphaned.
-        let (_dir, store) = open_store();
-        let conn = store.conn();
-        let host_id = insert_host(conn);
-        let uuid = "11111111-1111-1111-1111-111111111111";
-        insert_active_session(conn, host_id, uuid, "missingapp");
-
-        // Agent returns empty list (no sessions)
-        let port = spawn_list_server(encode_list_response(vec![])).await;
-        run_list(make_ctx(
-            conn,
-            move |_| MockExec::new(agent_running_responses(port)),
-            false,
-        ))
-        .await
-        .unwrap();
 
         let s = session_repo::get_by_uuid(conn, uuid).unwrap().unwrap();
-        assert_eq!(s.status, "orphaned", "active mux- session absent from agent → orphaned");
-    }
-
-    #[tokio::test]
-    async fn list_resurrects_unreachable_session_when_agent_has_it() {
-        // DB has unreachable session; agent now reports it as active → resurrect.
-        let (_dir, store) = open_store();
-        let conn = store.conn();
-        let host_id = insert_host(conn);
-        let uuid = "22222222-2222-2222-2222-222222222222";
-        insert_active_session(conn, host_id, uuid, "aliveapp");
-        session_repo::set_status(conn, uuid, "unreachable", 2_000_000).unwrap();
-
-        let agent_resp = vec![make_session_info(uuid, "aliveapp", SessionStatusValue::Active)];
-        let port = spawn_list_server(encode_list_response(agent_resp)).await;
-        run_list(make_ctx(
-            conn,
-            move |_| MockExec::new(agent_running_responses(port)),
-            false,
-        ))
-        .await
-        .unwrap();
-
-        let s = session_repo::get_by_uuid(conn, uuid).unwrap().unwrap();
-        assert_eq!(s.status, "active", "unreachable session must be resurrected when agent reports it");
-    }
-
-    #[tokio::test]
-    async fn list_imports_unknown_live_session() {
-        // Agent reports a session whose UUID is not in the DB → import as active.
-        let (_dir, store) = open_store();
-        let conn = store.conn();
-        let host_id = insert_host(conn);
-
-        let unknown_uuid = "33333333-3333-3333-3333-333333333333";
-        let agent_resp = vec![make_session_info(unknown_uuid, "imported-app", SessionStatusValue::Active)];
-        let port = spawn_list_server(encode_list_response(agent_resp)).await;
-        run_list(make_ctx(
-            conn,
-            move |_| MockExec::new(agent_running_responses(port)),
-            false,
-        ))
-        .await
-        .unwrap();
-
-        let s = session_repo::get_by_uuid(conn, unknown_uuid).unwrap();
-        assert!(s.is_some(), "unknown live session must be imported into DB");
-        let s = s.unwrap();
-        assert_eq!(s.status, "active");
-        assert!(s.imported, "imported flag must be set");
-        assert_eq!(s.host_id, host_id);
-        assert_eq!(s.shortname, "imported-app");
-    }
-
-    #[tokio::test]
-    async fn list_non_mux_prefix_session_missing_from_agent_marked_unreachable() {
-        // Agent ran; DB session does NOT have mux- prefix; not in agent list → unreachable (not orphaned).
-        let (_dir, store) = open_store();
-        let conn = store.conn();
-        let host_id = insert_host(conn);
-        let uuid = "44444444-4444-4444-4444-444444444444";
-
-        // Insert a session without mux- prefix in tmux_name
-        session_repo::reserve(
-            conn,
-            &ReserveParams {
-                uuid,
-                host_id,
-                shortname: "extapp",
-                repo_slug: "owner/repo",
-                branch: "main",
-                created_at: 1_000_000,
-            },
-        )
-        .unwrap();
-        // Activate with a non-mux tmux_name
-        activate(conn, uuid, "ext-session", "/work/ext", "tcp", 1_000_001).unwrap();
-
-        let port = spawn_list_server(encode_list_response(vec![])).await;
-        run_list(make_ctx(
-            conn,
-            move |_| MockExec::new(agent_running_responses(port)),
-            false,
-        ))
-        .await
-        .unwrap();
-
-        let s = session_repo::get_by_uuid(conn, uuid).unwrap().unwrap();
-        assert_eq!(s.status, "unreachable", "non-mux session not in agent list → unreachable");
-    }
-
-    #[tokio::test]
-    async fn list_mux_prefix_filter_excludes_non_mux_agent_sessions() {
-        // Agent returns a session without mux- prefix; must NOT be imported.
-        let (_dir, store) = open_store();
-        let conn = store.conn();
-        let host_id = insert_host(conn);
-
-        let non_mux_uuid = "55555555-5555-5555-5555-555555555555";
-        // Manually construct a session info without mux- prefix
-        let non_mux_info = RpcSessionInfo {
-            uuid: non_mux_uuid.to_owned(),
-            shortname: "external-app".to_owned(),
-            tmux_name: "external-app".to_owned(), // no mux- prefix
-            workdir: "/work/external".to_owned(),
-            status: SessionStatusValue::Active,
-        };
-        let port = spawn_list_server(encode_list_response(vec![non_mux_info])).await;
-        run_list(make_ctx(
-            conn,
-            move |_| MockExec::new(agent_running_responses(port)),
-            false,
-        ))
-        .await
-        .unwrap();
-
-        // Session must NOT be imported (no mux- prefix → filtered out)
-        let s = session_repo::get_by_uuid(conn, non_mux_uuid).unwrap();
-        assert!(s.is_none(), "non-mux-prefixed agent session must not be imported");
-    }
-
-    #[tokio::test]
-    async fn list_dead_uuid_in_agent_does_not_crash_and_stays_dead() {
-        // Regression: agent reports a UUID that exists in DB as `dead`.
-        // Previously this could hit the UNIQUE constraint in import_session and
-        // abort the entire mux list run. The row must stay dead; no duplicate created.
-        let (_dir, store) = open_store();
-        let conn = store.conn();
-        let host_id = insert_host(conn);
-        let dead_uuid = "66666666-6666-6666-6666-666666666666";
-        insert_active_session(conn, host_id, dead_uuid, "deadapp2");
-        session_repo::set_status(conn, dead_uuid, "dead", 2_000_000).unwrap();
-
-        let agent_resp = vec![make_session_info(dead_uuid, "deadapp2", SessionStatusValue::Active)];
-        let port = spawn_list_server(encode_list_response(agent_resp)).await;
-        run_list(make_ctx(
-            conn,
-            move |_| MockExec::new(agent_running_responses(port)),
-            false,
-        ))
-        .await
-        .unwrap(); // must not crash with UNIQUE violation
-
-        let s = session_repo::get_by_uuid(conn, dead_uuid).unwrap().unwrap();
-        assert_eq!(s.status, "dead", "dead session must stay dead even if agent reports it");
+        assert_eq!(s.status, "unreachable");
     }
 }

@@ -11,9 +11,10 @@
 //!      d. Unreachable session present in agent → resurrected to active.
 //!      e. Status sync: agent-reported status written to DB.
 //!   5. Dead and orphaned sessions are never resurfaced by reconciliation.
-//!   6. Sessions sorted by created_at ascending within each host (SQL ORDER BY).
+//!   6. list_for_host returns sessions in created_at ascending order (SQL ORDER BY).
 //!   7. Multiple hosts reconciled independently.
 //!   8. Non-mux-prefixed agent sessions are not imported.
+//!   9. --plain flag: accepted; DB state unaffected (output format not directly asserted here).
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -160,6 +161,11 @@ fn session_info(uuid: &str, shortname: &str, status: SessionStatusValue) -> Sess
 
 /// docs/07 §List flow point 1: in-flight reservation rows (tmux_name IS NULL)
 /// are excluded from list reconciliation.
+///
+/// Protection mechanism: `list_for_host` filters `tmux_name IS NOT NULL`, so the
+/// in-flight UUID is absent from `all_uuids`. The import path then issues an INSERT
+/// that is silently swallowed by the UNIQUE constraint + `INSERT OR IGNORE` in
+/// `import_session`, leaving the in-flight row intact.
 #[tokio::test]
 async fn list_in_flight_reservation_excluded_from_reconciliation() {
     let (_dir, store) = open_store();
@@ -182,8 +188,8 @@ async fn list_in_flight_reservation_excluded_from_reconciliation() {
     .unwrap();
     // NOT activated — tmux_name remains NULL.
 
-    // Agent reports the same UUID as active (should not be imported as a duplicate,
-    // and must not overwrite the in-flight reservation).
+    // Agent reports the same UUID as active. The UNIQUE constraint + INSERT OR IGNORE
+    // prevents duplication; the in-flight reservation row is not mutated.
     let agent_resp = vec![SessionInfo {
         uuid: in_flight_uuid.to_owned(),
         shortname: "inflight".to_owned(),
@@ -203,7 +209,7 @@ async fn list_in_flight_reservation_excluded_from_reconciliation() {
         s.tmux_name.is_none(),
         "in-flight reservation (tmux_name IS NULL) must not be activated by list"
     );
-    assert_eq!(s.imported, false, "in-flight reservation must not be replaced by an import");
+    assert!(!s.imported, "in-flight reservation must not be replaced by an import");
 }
 
 /// docs/07 §List flow point 2: SSH health probe must NOT perform TOFU.
@@ -513,9 +519,10 @@ async fn list_multiple_hosts_reconciled_independently() {
     assert_eq!(s2.status, "unreachable", "session on unreachable host must be marked unreachable");
 }
 
-/// docs/07 point 4 & list_for_host SQL: sessions sorted by created_at ASC within host.
+/// list_for_host returns sessions ordered by created_at ASC within a host.
+/// The display layer iterates the result in this order; the ORDER BY is in the SQL query.
 #[tokio::test]
-async fn list_sessions_returned_in_created_at_ascending_order() {
+async fn list_for_host_returns_sessions_in_created_at_ascending_order() {
     let (_dir, store) = open_store();
     let conn = store.conn();
     let host_id = insert_host(conn);
@@ -526,20 +533,15 @@ async fn list_sessions_returned_in_created_at_ascending_order() {
     insert_active_session(conn, host_id, uuid_late, "app-late", 2_000_000);
     insert_active_session(conn, host_id, uuid_early, "app-early", 1_000_000);
 
-    // Verify via list_for_host that the DB returns them in created_at order.
     let sessions = session_repo::list_for_host(conn, host_id).unwrap();
     assert_eq!(sessions.len(), 2);
     assert_eq!(sessions[0].uuid, uuid_early, "earlier created_at must be first");
     assert_eq!(sessions[1].uuid, uuid_late, "later created_at must be second");
-
-    // run_list must succeed; display inherits the ORDER BY from list_for_host.
-    run_list(list_ctx(conn, |_| MockExec::unreachable(), false))
-        .await
-        .unwrap();
 }
 
-/// docs/07 point 5: --plain flag produces tab-separated output.
-/// Verifies the flag is accepted with sessions present and DB state is unaffected.
+/// --plain flag: accepted with sessions present; DB state is unaffected.
+/// Output format (tab-separated columns) is not directly asserted here —
+/// that requires refactoring display_all to accept a writer.
 #[tokio::test]
 async fn list_plain_flag_succeeds_with_sessions() {
     let (_dir, store) = open_store();
