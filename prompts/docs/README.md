@@ -48,9 +48,9 @@ Implementation beads cite this index to find the canonical section for each requ
 | `clean-room-guardrails.md` | done | mux-ii3 |
 | `cli-contract.md` | done | mux-pre |
 | `sqlite-state.md` | done | mux-8ep |
-| `ssh-transport.md` | pending | mux-7nr |
+| `ssh-transport.md` | done | mux-7nr |
 | `stack-validation.md` | done | mux-a2b |
-| `rpc-protocol.md` | pending | mux-2n5 |
+| `rpc-protocol.md` | done | mux-2n5 |
 | `tmux-contract.md` | done | mux-14j |
 | `session-flows.md` | done | mux-s66 |
 | `release.md` | pending | mux-7ng |
