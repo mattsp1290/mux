@@ -2,6 +2,53 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
+/// Maximum bytes of stderr captured from a git clone failure.
+/// Prevents multi-KB output from polluting structured logs or user-visible messages.
+pub const MAX_STDERR_BYTES: usize = 2048;
+
+/// Truncate stderr from a spawned process to at most MAX_STDERR_BYTES bytes and
+/// redact any `user:pass@` credential fragments that git may echo in clone URLs.
+///
+/// Callers constructing `MuxError::GitCloneFailed` must pass stderr through this
+/// function so the invariant is enforced at construction rather than Display time.
+pub fn truncate_stderr(s: &str) -> String {
+    // Redact credentials of the form `user:pass@` in URLs.
+    let redacted = {
+        // Simple state-machine redaction: replace `word:word@` patterns.
+        let mut out = String::with_capacity(s.len().min(MAX_STDERR_BYTES + 64));
+        let mut rest = s;
+        while let Some(at_pos) = rest.find('@') {
+            let before = &rest[..at_pos];
+            if let Some(colon_pos) = before.rfind(':') {
+                // Check the segment before the colon looks like a password (no spaces).
+                let user_pass = &before[colon_pos + 1..];
+                if !user_pass.contains(' ') && !user_pass.is_empty() {
+                    out.push_str(&before[..colon_pos + 1]);
+                    out.push_str("****@");
+                    rest = &rest[at_pos + 1..];
+                    continue;
+                }
+            }
+            out.push_str(&before[..at_pos + 1]);
+            rest = &rest[at_pos + 1..];
+        }
+        out.push_str(rest);
+        out
+    };
+    // Truncate to MAX_STDERR_BYTES bytes (on a char boundary).
+    if redacted.len() <= MAX_STDERR_BYTES {
+        redacted
+    } else {
+        let truncated = &redacted[..redacted
+            .char_indices()
+            .take_while(|(i, _)| *i < MAX_STDERR_BYTES)
+            .last()
+            .map(|(i, c)| i + c.len_utf8())
+            .unwrap_or(0)];
+        format!("{truncated}… [truncated]")
+    }
+}
+
 #[non_exhaustive]
 #[derive(Debug, Error)]
 pub enum MuxError {
@@ -25,7 +72,8 @@ pub enum MuxError {
     #[error("invalid session status: {0}")]
     InvalidSessionStatus(String),
 
-    /// Raised when resolving the mux state directory — implemented in mux-init.
+    /// Raised when resolving the mux state directory.
+    /// Exit code 1 (user input category): the user must set HOME or run in a valid environment.
     #[error("home directory not found")]
     HomeDirNotFound,
 
@@ -59,6 +107,9 @@ pub enum MuxError {
 
     // ── Create-flow: remote errors (exit code 1) ─────────────────────────────
     /// `git clone` exited with a non-zero status.
+    ///
+    /// `stderr` must be pre-processed with `truncate_stderr()` before construction
+    /// to cap length and redact any `user:pass@` credential fragments.
     #[error("git clone failed with exit code {exit_code}: {stderr}")]
     GitCloneFailed { exit_code: i32, stderr: String },
 
@@ -76,7 +127,12 @@ pub enum MuxError {
     RpcError(String),
 
     // ── Create-flow: internal errors (exit code 2) ───────────────────────────
-    /// Catch-all for unexpected errors that do not fit a more specific category.
+    /// Catch-all for genuinely unexpected/internal errors (DB corruption, impossible
+    /// state, etc.). Reserved for errors that have no more-specific variant — do NOT
+    /// route classifiable errors (SSH, RPC, git) through `Other`. Callers that need
+    /// `anyhow::Error` → `MuxError` for a known category must map to the specific
+    /// variant first; only fall back to `?` (which invokes `From<anyhow::Error>`)
+    /// when the error truly is unclassifiable.
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
@@ -98,12 +154,47 @@ impl MuxError {
         }
     }
 
+    /// Returns the canonical error category string for observability (docs/08).
+    ///
+    /// This is the single source of truth for `CreateFlowMetrics.error_category`.
+    /// Callers must use `err.category()` rather than ad-hoc string literals.
+    pub fn category(&self) -> &'static str {
+        match self {
+            MuxError::WorkdirPreExisting(_) => "workdir_pre_existing",
+            MuxError::GitCloneFailed { .. } => "git_clone_failed",
+            MuxError::SshAgentNotForwarded => "ssh_agent_not_forwarded",
+            MuxError::SessionAlreadyExists { .. } => "session_already_exists",
+            MuxError::ShortnameExhausted => "shortname_exhausted",
+            MuxError::RpcError(_) | MuxError::AgentError(_) => "rpc_error",
+            MuxError::Other(_) => "other",
+            // Remaining variants: user-input or host errors without a dedicated spec category.
+            _ => "other",
+        }
+    }
+
     /// Returns the exit code that should be used when this error terminates the process.
-    /// Category "internal" errors use exit code 2; all others use 1.
+    ///
+    /// Exit code 2 = internal error (MuxError::Other). All other categories = 1.
+    /// Explicit arms prevent future variants from silently inheriting the wrong code.
     pub fn exit_code(&self) -> i32 {
         match self {
+            MuxError::InvalidHostAlias(_)
+            | MuxError::InvalidPort(_)
+            | MuxError::InvalidEndpoint(_)
+            | MuxError::InvalidRepo(_)
+            | MuxError::InvalidSessionStatus(_)
+            | MuxError::HomeDirNotFound
+            | MuxError::WorkdirPreExisting(_)
+            | MuxError::SessionAlreadyExists { .. }
+            | MuxError::ShortnameExhausted
+            | MuxError::HostKeyMismatch
+            | MuxError::ConnectionRefused(_)
+            | MuxError::ConnectionTimeout(_)
+            | MuxError::GitCloneFailed { .. }
+            | MuxError::SshAgentNotForwarded
+            | MuxError::AgentError(_)
+            | MuxError::RpcError(_) => 1,
             MuxError::Other(_) => 2,
-            _ => 1,
         }
     }
 }
@@ -355,5 +446,114 @@ mod tests {
         assert_eq!(MuxError::ShortnameExhausted.exit_code(), 1);
         assert_eq!(MuxError::HostKeyMismatch.exit_code(), 1);
         assert_eq!(MuxError::SshAgentNotForwarded.exit_code(), 1);
+    }
+
+    // ── category() ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn category_all_spec_values_present() {
+        let allowed: &[&str] = &[
+            "workdir_pre_existing",
+            "git_clone_failed",
+            "ssh_agent_not_forwarded",
+            "session_already_exists",
+            "shortname_exhausted",
+            "rpc_error",
+            "other",
+        ];
+        let cases: &[MuxError] = &[
+            MuxError::WorkdirPreExisting(PathBuf::from("/tmp")),
+            MuxError::GitCloneFailed {
+                exit_code: 1,
+                stderr: String::new(),
+            },
+            MuxError::SshAgentNotForwarded,
+            MuxError::SessionAlreadyExists {
+                host: "h".into(),
+                shortname: "s".into(),
+            },
+            MuxError::ShortnameExhausted,
+            MuxError::RpcError("x".into()),
+            MuxError::Other(anyhow!("boom")),
+        ];
+        for e in cases {
+            let cat = e.category();
+            assert!(
+                allowed.contains(&cat),
+                "category '{cat}' is not in the allowed spec list for variant {e:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn other_category_is_other() {
+        let e: MuxError = anyhow!("internal").into();
+        assert_eq!(e.category(), "other");
+        assert_eq!(e.exit_code(), 2);
+    }
+
+    // ── truncate_stderr ───────────────────────────────────────────────────────
+
+    #[test]
+    fn truncate_stderr_passes_through_short_input() {
+        let s = "fatal: repository not found";
+        assert_eq!(super::truncate_stderr(s), s);
+    }
+
+    #[test]
+    fn truncate_stderr_caps_long_input() {
+        let long = "x".repeat(super::MAX_STDERR_BYTES + 100);
+        let result = super::truncate_stderr(&long);
+        assert!(
+            result.len() <= super::MAX_STDERR_BYTES + 64,
+            "truncated result too long: {}",
+            result.len()
+        );
+        assert!(result.contains("[truncated]"));
+    }
+
+    #[test]
+    fn truncate_stderr_redacts_credentials() {
+        let s = "clone https://user:secret@github.com/org/repo failed";
+        let result = super::truncate_stderr(s);
+        assert!(
+            !result.contains("secret"),
+            "credential not redacted: {result}"
+        );
+        assert!(
+            result.contains("****@"),
+            "redaction marker missing: {result}"
+        );
+        assert!(
+            result.contains("github.com"),
+            "URL host should be preserved: {result}"
+        );
+    }
+
+    // ── No mux: prefix in error messages ─────────────────────────────────────
+
+    #[test]
+    fn no_variant_display_starts_with_mux_prefix() {
+        // Guard against double-prefixing: the CLI adds "mux: " at the boundary.
+        // Error messages must NOT include it themselves.
+        let variants: &[MuxError] = &[
+            MuxError::InvalidHostAlias("x".into()),
+            MuxError::WorkdirPreExisting(PathBuf::from("/tmp")),
+            MuxError::GitCloneFailed {
+                exit_code: 1,
+                stderr: "e".into(),
+            },
+            MuxError::SshAgentNotForwarded,
+            MuxError::HostKeyMismatch,
+            MuxError::RpcError("x".into()),
+            MuxError::Other(anyhow!("boom")),
+        ];
+        for e in variants {
+            let s = e.to_string();
+            assert!(
+                !s.starts_with("mux:"),
+                "variant {e:?} display starts with 'mux:': {s}"
+            );
+        }
     }
 }
