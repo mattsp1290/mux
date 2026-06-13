@@ -194,4 +194,50 @@ mod tests {
             .unwrap();
         assert_eq!(mode, "wal", "journal_mode should be WAL");
     }
+
+    // ── concurrent open ───────────────────────────────────────────────────────
+
+    #[test]
+    fn two_connections_to_same_db_both_succeed() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("mux.db");
+        let store1 = Store::open(&db_path).unwrap();
+        let store2 = Store::open(&db_path).unwrap();
+        // Both connections open and read successfully (verifies Store::open is not
+        // exclusive and WAL sidecar files are handled correctly).
+        let n1: i64 = store1
+            .conn()
+            .query_row("SELECT COUNT(*) FROM hosts", [], |r| r.get(0))
+            .unwrap();
+        let n2: i64 = store2
+            .conn()
+            .query_row("SELECT COUNT(*) FROM hosts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n1, 0);
+        assert_eq!(n2, 0);
+    }
+
+    #[test]
+    fn write_on_first_connection_visible_on_second() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("mux.db");
+        let store1 = Store::open(&db_path).unwrap();
+        let store2 = Store::open(&db_path).unwrap();
+        // host_repo::insert runs a single autocommit INSERT on store1.
+        crate::host_repo::insert(store1.conn(), "host-a", "u", "1.2.3.4", 22, 1_000_000).unwrap();
+        // Each bare SELECT is its own implicit read transaction starting after the
+        // INSERT commits; WAL mode makes the write visible immediately to store2.
+        let n: i64 = store2
+            .conn()
+            .query_row("SELECT COUNT(*) FROM hosts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "committed write on store1 should be visible via store2");
+        // Symmetric: write on store2 is visible to store1.
+        crate::host_repo::insert(store2.conn(), "host-b", "u", "2.3.4.5", 22, 1_000_001).unwrap();
+        let n2: i64 = store1
+            .conn()
+            .query_row("SELECT COUNT(*) FROM hosts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n2, 2, "committed write on store2 should be visible via store1");
+    }
 }

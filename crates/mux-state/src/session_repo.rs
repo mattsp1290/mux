@@ -476,6 +476,37 @@ mod tests {
     }
 
     #[test]
+    fn cancel_activated_session_returns_false() {
+        let (_dir, store) = open_store();
+        let conn = store.conn();
+        let host_id = insert_host(conn);
+        reserve(conn, &make_reserve("act-uuid", host_id)).unwrap();
+        activate(conn, "act-uuid", "mux-act", "/work", "tcp", 2_000_000).unwrap();
+        // cancel_reservation only deletes in-flight (tmux_name IS NULL) rows.
+        let removed = cancel_reservation(conn, "act-uuid").unwrap();
+        assert!(!removed, "activated session must not be removed by cancel_reservation");
+        let s = get_by_uuid(conn, "act-uuid").unwrap().expect("activated session should still exist");
+        // Verify the activated fields are untouched (cancel is a true no-op, not a mutation).
+        assert_eq!(s.tmux_name.as_deref(), Some("mux-act"), "tmux_name should be preserved");
+        assert_eq!(s.workdir.as_deref(), Some("/work"), "workdir should be preserved");
+    }
+
+    #[test]
+    fn all_documented_status_values_accepted() {
+        let (_dir, store) = open_store();
+        let conn = store.conn();
+        let host_id = insert_host(conn);
+        // docs/03 §SessionStatus values: active, dead, unreachable, orphaned
+        for (i, status) in ["dead", "unreachable", "orphaned", "active"].iter().enumerate() {
+            let uuid = format!("status-uuid-{i}");
+            reserve(conn, &make_reserve(&uuid, host_id)).unwrap();
+            set_status(conn, &uuid, status, 2_000_000).unwrap();
+            let s = get_by_uuid(conn, &uuid).unwrap().unwrap();
+            assert_eq!(s.status, *status, "status '{status}' should round-trip");
+        }
+    }
+
+    #[test]
     fn reserve_duplicate_uuid_fails() {
         let (_dir, store) = open_store();
         let conn = store.conn();
