@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
+use mux_core::event_bus::{BusEvent, EventBus};
 use mux_rpc::server::RpcServer;
 use mux_tmux::adapter::TmuxAdapter;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -18,20 +20,30 @@ async fn main() -> Result<()> {
         .unwrap_or(0);
     let bind_addr = format!("{bind_host}:{port}");
 
+    let bus = Arc::new(EventBus::new());
+
     let tmux = TmuxAdapter::new();
     let server = RpcServer::new_with_tmux(bind_addr, tmux);
-    let bound = server.bind().await.context("failed to bind RPC server")?;
+    let bound = server
+        .bind()
+        .await
+        .context("failed to bind RPC server")?
+        .with_event_bus(Arc::clone(&bus));
 
     let local_addr = bound.local_addr();
-    tracing::info!("mux-agent listening on {local_addr}");
+    tracing::info!(listen_addr = %local_addr, "mux-agent started");
 
     write_lock_file(&mux_home, local_addr)?;
+    bus.publish(BusEvent::AgentStarted { listen_addr: local_addr.to_string() });
 
     let result = bound.serve().await;
 
-    // Clean up lock file on exit
+    // Clean up lock file on exit.
     let lock_path = mux_home.join("agent.lock");
     let _ = std::fs::remove_file(&lock_path);
+
+    tracing::info!("mux-agent stopped");
+    bus.publish(BusEvent::AgentStopped);
 
     result
 }

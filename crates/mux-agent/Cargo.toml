@@ -11,6 +11,7 @@ name = "mux-agent"
 path = "src/main.rs"
 
 [dependencies]
+mux-core = { path = "../mux-core" }
 mux-rpc = { path = "../mux-rpc" }
 mux-tmux = { path = "../mux-tmux" }
 anyhow.workspace = true

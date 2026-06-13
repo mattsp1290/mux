@@ -13,6 +13,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 
+use mux_core::event_bus::{BusEvent, EventBus, RpcRequestEvent};
+
 use mux_tmux::adapter::{SessionInfo as TmuxSessionInfo, TmuxAdapter, TmuxError};
 
 use crate::schema::{
@@ -100,6 +102,7 @@ pub struct BoundRpcServer<T = TmuxAdapter> {
     pub(crate) shutdown_flag: Arc<AtomicBool>,
     shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
+    event_bus: Option<Arc<EventBus>>,
 }
 
 impl RpcServer {
@@ -137,6 +140,7 @@ impl<T: TmuxOps> RpcServer<T> {
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             shutdown_tx,
             shutdown_rx,
+            event_bus: None,
         })
     }
 }
@@ -145,6 +149,13 @@ impl<T: TmuxOps> RpcServer<T> {
 impl<T: TmuxOps> BoundRpcServer<T> {
     pub fn local_addr(&self) -> std::net::SocketAddr {
         self.listener.local_addr().expect("listener has a local addr")
+    }
+
+    /// Attach an event bus. Each completed RPC call will publish a
+    /// [`BusEvent::RpcRequest`] to the bus (non-blocking).
+    pub fn with_event_bus(mut self, bus: Arc<EventBus>) -> Self {
+        self.event_bus = Some(bus);
+        self
     }
 
     pub async fn serve(mut self) -> anyhow::Result<()> {
@@ -158,8 +169,9 @@ impl<T: TmuxOps> BoundRpcServer<T> {
                             let ownership = Arc::clone(&self.ownership);
                             let shutdown_flag = Arc::clone(&self.shutdown_flag);
                             let shutdown_tx = self.shutdown_tx.clone();
+                            let event_bus = self.event_bus.as_ref().map(Arc::clone);
                             tokio::spawn(async move {
-                                handle_connection(stream, tmux, ownership, shutdown_flag, shutdown_tx).await;
+                                handle_connection(stream, tmux, ownership, shutdown_flag, shutdown_tx, event_bus).await;
                             });
                         }
                         Err(e) => {
@@ -210,6 +222,7 @@ async fn handle_connection<T: TmuxOps>(
     ownership: OwnershipMap,
     shutdown_flag: Arc<AtomicBool>,
     shutdown_tx: watch::Sender<bool>,
+    event_bus: Option<Arc<EventBus>>,
 ) {
     loop {
         let raw = match read_message(&mut stream).await {
@@ -228,8 +241,22 @@ async fn handle_connection<T: TmuxOps>(
             }
         };
 
+        // Capture op name for tracing before consuming request in the match below.
+        let op_name: &'static str = match &request {
+            Request::Health(_) => "Health",
+            Request::CreateSession(_) => "CreateSession",
+            Request::ListSessions(_) => "ListSessions",
+            Request::GetSession(_) => "GetSession",
+            Request::KillSession(_) => "KillSession",
+            Request::Shutdown(_) => "Shutdown",
+            Request::StreamSessionEvents(_) => "StreamSessionEvents",
+        };
+        let dispatch_start = std::time::Instant::now();
+
         // Set to true when Shutdown is dispatched; triggers watch signal after response.
         let mut trigger_shutdown = false;
+        // Set to false when the response contains an RpcError.
+        let mut dispatch_success = true;
 
         let response_bytes: Vec<u8> = match request {
             Request::Health(_) => {
@@ -239,6 +266,7 @@ async fn handle_connection<T: TmuxOps>(
 
             Request::CreateSession(req) => {
                 if shutdown_flag.load(Ordering::SeqCst) {
+                    dispatch_success = false;
                     let err: RpcResult<CreateSessionResponse> =
                         RpcResult::Err(RpcError::internal("agent is shutting down"));
                     serde_json::to_vec(&err).unwrap_or_default()
@@ -249,6 +277,7 @@ async fn handle_connection<T: TmuxOps>(
                     // Reject duplicate UUIDs before touching tmux to avoid orphaned sessions.
                     let already_exists = ownership.lock().unwrap().contains_key(&req.uuid);
                     if already_exists {
+                        dispatch_success = false;
                         let err: RpcResult<CreateSessionResponse> =
                             RpcResult::Err(RpcError::internal("session with this uuid already exists"));
                         serde_json::to_vec(&err).unwrap_or_default()
@@ -256,6 +285,7 @@ async fn handle_connection<T: TmuxOps>(
 
                     match tmux.new_session(&tmux_name, &workdir).await {
                         Err(e) => {
+                            dispatch_success = false;
                             let err: RpcResult<CreateSessionResponse> =
                                 RpcResult::Err(RpcError::tmux_error(e.to_string()));
                             serde_json::to_vec(&err).unwrap_or_default()
@@ -290,6 +320,7 @@ async fn handle_connection<T: TmuxOps>(
             Request::ListSessions(_) => {
                 match tmux.list_sessions().await {
                     Err(e) => {
+                        dispatch_success = false;
                         let err: RpcResult<ListSessionsResponse> =
                             RpcResult::Err(RpcError::tmux_error(e.to_string()));
                         serde_json::to_vec(&err).unwrap_or_default()
@@ -332,6 +363,7 @@ async fn handle_connection<T: TmuxOps>(
 
                 match entry_info {
                     None => {
+                        dispatch_success = false;
                         let err: RpcResult<GetSessionResponse> =
                             RpcResult::Err(RpcError::not_found(format!(
                                 "session {} not found",
@@ -342,6 +374,7 @@ async fn handle_connection<T: TmuxOps>(
                     Some((shortname, tmux_name)) => {
                         match tmux.list_sessions().await {
                             Err(e) => {
+                                dispatch_success = false;
                                 let err: RpcResult<GetSessionResponse> =
                                     RpcResult::Err(RpcError::tmux_error(e.to_string()));
                                 serde_json::to_vec(&err).unwrap_or_default()
@@ -378,12 +411,14 @@ async fn handle_connection<T: TmuxOps>(
 
                 match entry_info {
                     None => {
+                        dispatch_success = false;
                         let err: RpcResult<KillSessionResponse> =
                             RpcResult::Err(RpcError::not_owned("session not in ownership map"));
                         serde_json::to_vec(&err).unwrap_or_default()
                     }
                     Some((tmux_name, repo_slug, workdir, mux_created)) => {
                         if req.repo_slug != repo_slug {
+                            dispatch_success = false;
                             let err: RpcResult<KillSessionResponse> =
                                 RpcResult::Err(RpcError::not_owned("repo_slug mismatch"));
                             serde_json::to_vec(&err).unwrap_or_default()
@@ -453,11 +488,22 @@ async fn handle_connection<T: TmuxOps>(
             }
 
             Request::StreamSessionEvents(_) => {
+                dispatch_success = false;
                 let err: RpcResult<crate::schema::ShutdownResponse> =
                     RpcResult::Err(RpcError::internal("streaming not implemented"));
                 serde_json::to_vec(&err).unwrap_or_default()
             }
         };
+
+        let duration_ms = dispatch_start.elapsed().as_millis() as u64;
+        tracing::info!(method = op_name, duration_ms, success = dispatch_success, "rpc.request");
+        if let Some(ref bus) = event_bus {
+            bus.publish(BusEvent::RpcRequest(RpcRequestEvent {
+                method: op_name.to_owned(),
+                duration_ms,
+                success: dispatch_success,
+            }));
+        }
 
         if let Err(e) = write_message(&mut stream, &response_bytes).await {
             tracing::debug!(error = %e, "failed to write response");
