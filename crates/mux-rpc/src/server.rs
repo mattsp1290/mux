@@ -4,6 +4,8 @@
 //! All requests carry an `"op"` tag for dispatch (see `schema::Request`).
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -11,7 +13,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 
-use mux_tmux::adapter::TmuxAdapter;
+use mux_tmux::adapter::{SessionInfo as TmuxSessionInfo, TmuxAdapter, TmuxError};
 
 use crate::schema::{
     CreateSessionResponse, GetSessionResponse, HealthResponse, KillSessionResponse,
@@ -24,6 +26,50 @@ use crate::schema::{
 /// Maximum frame body size (4 MiB). Rejects attacker-controlled length prefixes
 /// before allocating, preventing OOM from a forged large-frame attack.
 const MAX_FRAME_LEN: usize = 4 * 1024 * 1024;
+
+// ── TmuxOps trait ─────────────────────────────────────────────────────────────
+
+/// Boxed future alias used by `TmuxOps` methods.
+type BoxFut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// Server-internal interface for tmux operations. Implemented by `TmuxAdapter`
+/// in production and by `MockTmuxOps` in tests.
+///
+/// Uses boxed futures so the `Send` bound is explicit at the trait level,
+/// allowing `handle_connection<T: TmuxOps>` to be spawned on a `tokio` thread pool.
+trait TmuxOps: Send + Sync + 'static {
+    /// Create a new detached tmux session `name` rooted at `workdir`.
+    fn new_session<'a>(
+        &'a self,
+        name: &'a str,
+        workdir: &'a str,
+    ) -> BoxFut<'a, Result<(), TmuxError>>;
+
+    /// Kill the tmux session named `name`.
+    fn kill_session<'a>(&'a self, name: &'a str) -> BoxFut<'a, Result<(), TmuxError>>;
+
+    /// Return all mux-prefixed tmux sessions visible to this adapter.
+    fn list_sessions(&self) -> BoxFut<'_, Result<Vec<TmuxSessionInfo>, TmuxError>>;
+}
+
+impl TmuxOps for TmuxAdapter {
+    fn new_session<'a>(
+        &'a self,
+        name: &'a str,
+        workdir: &'a str,
+    ) -> BoxFut<'a, Result<(), TmuxError>> {
+        // status_right is always None for agent-created sessions (spec §CreateSession).
+        Box::pin(TmuxAdapter::new_session(self, name, workdir, None))
+    }
+
+    fn kill_session<'a>(&'a self, name: &'a str) -> BoxFut<'a, Result<(), TmuxError>> {
+        Box::pin(TmuxAdapter::kill_session(self, name))
+    }
+
+    fn list_sessions(&self) -> BoxFut<'_, Result<Vec<TmuxSessionInfo>, TmuxError>> {
+        Box::pin(TmuxAdapter::list_sessions(self))
+    }
+}
 
 // ── Ownership map ─────────────────────────────────────────────────────────────
 
@@ -41,16 +87,17 @@ type OwnershipMap = Arc<Mutex<HashMap<String, OwnedSession>>>;
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
-pub struct RpcServer {
-    tmux: TmuxAdapter,
+pub struct RpcServer<T = TmuxAdapter> {
+    tmux: T,
     bind_addr: String,
 }
 
-pub struct BoundRpcServer {
+pub struct BoundRpcServer<T = TmuxAdapter> {
     listener: TcpListener,
-    tmux: Arc<TmuxAdapter>,
+    tmux: Arc<T>,
     ownership: OwnershipMap,
-    shutdown_flag: Arc<AtomicBool>,
+    // pub(crate): needed by tests in this file; no external consumer exists.
+    pub(crate) shutdown_flag: Arc<AtomicBool>,
     shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
 }
@@ -69,8 +116,18 @@ impl RpcServer {
             bind_addr: bind_addr.into(),
         }
     }
+}
 
-    pub async fn bind(self) -> anyhow::Result<BoundRpcServer> {
+#[allow(private_bounds)] // TmuxOps is intentionally sealed; T is never nameable outside this crate.
+impl<T: TmuxOps> RpcServer<T> {
+    pub fn with_backend(bind_addr: impl Into<String>, tmux: T) -> Self {
+        Self {
+            tmux,
+            bind_addr: bind_addr.into(),
+        }
+    }
+
+    pub async fn bind(self) -> anyhow::Result<BoundRpcServer<T>> {
         let listener = TcpListener::bind(&self.bind_addr).await?;
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         Ok(BoundRpcServer {
@@ -84,7 +141,8 @@ impl RpcServer {
     }
 }
 
-impl BoundRpcServer {
+#[allow(private_bounds)] // TmuxOps is intentionally sealed; T is never nameable outside this crate.
+impl<T: TmuxOps> BoundRpcServer<T> {
     pub fn local_addr(&self) -> std::net::SocketAddr {
         self.listener.local_addr().expect("listener has a local addr")
     }
@@ -146,9 +204,9 @@ async fn write_message(stream: &mut TcpStream, body: &[u8]) -> anyhow::Result<()
 
 // ── Connection handler ────────────────────────────────────────────────────────
 
-async fn handle_connection(
+async fn handle_connection<T: TmuxOps>(
     mut stream: TcpStream,
-    tmux: Arc<TmuxAdapter>,
+    tmux: Arc<T>,
     ownership: OwnershipMap,
     shutdown_flag: Arc<AtomicBool>,
     shutdown_tx: watch::Sender<bool>,
@@ -188,7 +246,15 @@ async fn handle_connection(
                     let tmux_name = format!("mux-{}", req.shortname);
                     let workdir = format!("{}/{}", req.workdir_parent, req.repo_leaf);
 
-                    match tmux.new_session(&tmux_name, &workdir, None).await {
+                    // Reject duplicate UUIDs before touching tmux to avoid orphaned sessions.
+                    let already_exists = ownership.lock().unwrap().contains_key(&req.uuid);
+                    if already_exists {
+                        let err: RpcResult<CreateSessionResponse> =
+                            RpcResult::Err(RpcError::internal("session with this uuid already exists"));
+                        serde_json::to_vec(&err).unwrap_or_default()
+                    } else {
+
+                    match tmux.new_session(&tmux_name, &workdir).await {
                         Err(e) => {
                             let err: RpcResult<CreateSessionResponse> =
                                 RpcResult::Err(RpcError::tmux_error(e.to_string()));
@@ -217,6 +283,7 @@ async fn handle_connection(
                             serde_json::to_vec(&resp).unwrap_or_default()
                         }
                     }
+                    } // end if already_exists else
                 }
             }
 
@@ -409,7 +476,124 @@ async fn handle_connection(
 #[cfg(test)]
 mod tests {
     use super::*;
-    // Helper: create a connected loopback TCP pair for testing codec.
+    use mux_tmux::adapter::TmuxError;
+    use std::sync::atomic::AtomicUsize;
+
+    // ── MockTmuxOps ───────────────────────────────────────────────────────────
+
+    /// Configurable tmux backend for unit tests. All fields are `Send + Sync`.
+    struct MockTmuxOps {
+        /// Sessions returned by list_sessions.
+        live_sessions: Arc<Mutex<Vec<TmuxSessionInfo>>>,
+        /// Error to return from new_session (None = Ok(())).
+        new_session_error: Option<String>,
+        /// Error to return from kill_session (None = Ok(())).
+        kill_session_error: Option<String>,
+        /// Error to return from list_sessions (None = Ok(sessions)).
+        list_sessions_error: Option<String>,
+        /// Calls recorded for new_session: (name, workdir).
+        new_session_calls: Arc<Mutex<Vec<(String, String)>>>,
+        /// Calls recorded for kill_session: name.
+        kill_session_calls: Arc<Mutex<Vec<String>>>,
+        /// Incremented each time list_sessions is called.
+        list_sessions_count: Arc<AtomicUsize>,
+    }
+
+    impl MockTmuxOps {
+        fn new() -> Self {
+            Self {
+                live_sessions: Arc::new(Mutex::new(Vec::new())),
+                new_session_error: None,
+                kill_session_error: None,
+                list_sessions_error: None,
+                new_session_calls: Arc::new(Mutex::new(Vec::new())),
+                kill_session_calls: Arc::new(Mutex::new(Vec::new())),
+                list_sessions_count: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn with_live_sessions(mut self, sessions: Vec<TmuxSessionInfo>) -> Self {
+            *self.live_sessions.lock().unwrap() = sessions;
+            self
+        }
+
+        fn with_new_session_error(mut self, msg: impl Into<String>) -> Self {
+            self.new_session_error = Some(msg.into());
+            self
+        }
+
+        fn with_kill_session_error(mut self, msg: impl Into<String>) -> Self {
+            self.kill_session_error = Some(msg.into());
+            self
+        }
+
+        fn with_list_sessions_error(mut self, msg: impl Into<String>) -> Self {
+            self.list_sessions_error = Some(msg.into());
+            self
+        }
+    }
+
+    fn make_tmux_session(name: &str) -> TmuxSessionInfo {
+        TmuxSessionInfo {
+            name: name.to_owned(),
+            created: 1_700_000_000,
+            activity: 1_700_000_001,
+        }
+    }
+
+    impl TmuxOps for MockTmuxOps {
+        fn new_session<'a>(
+            &'a self,
+            name: &'a str,
+            workdir: &'a str,
+        ) -> BoxFut<'a, Result<(), TmuxError>> {
+            self.new_session_calls
+                .lock()
+                .unwrap()
+                .push((name.to_owned(), workdir.to_owned()));
+            let result = if let Some(ref msg) = self.new_session_error {
+                Err(TmuxError::TmuxFailed {
+                    command: vec!["tmux".to_owned()],
+                    exit_code: Some(1),
+                    stderr: msg.clone(),
+                })
+            } else {
+                Ok(())
+            };
+            Box::pin(async move { result })
+        }
+
+        fn kill_session<'a>(&'a self, name: &'a str) -> BoxFut<'a, Result<(), TmuxError>> {
+            self.kill_session_calls.lock().unwrap().push(name.to_owned());
+            let result = if let Some(ref msg) = self.kill_session_error {
+                Err(TmuxError::TmuxFailed {
+                    command: vec!["tmux".to_owned()],
+                    exit_code: Some(1),
+                    stderr: msg.clone(),
+                })
+            } else {
+                Ok(())
+            };
+            Box::pin(async move { result })
+        }
+
+        fn list_sessions(&self) -> BoxFut<'_, Result<Vec<TmuxSessionInfo>, TmuxError>> {
+            self.list_sessions_count.fetch_add(1, Ordering::SeqCst);
+            let result = if let Some(ref msg) = self.list_sessions_error {
+                Err(TmuxError::TmuxFailed {
+                    command: vec!["tmux".to_owned()],
+                    exit_code: Some(1),
+                    stderr: msg.clone(),
+                })
+            } else {
+                Ok(self.live_sessions.lock().unwrap().clone())
+            };
+            Box::pin(async move { result })
+        }
+    }
+
+    // ── Test helpers ──────────────────────────────────────────────────────────
+
     async fn loopback_pair() -> (TcpStream, TcpStream) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -417,6 +601,29 @@ mod tests {
             tokio::join!(TcpStream::connect(addr), listener.accept());
         (client_res.unwrap(), server_res.unwrap().0)
     }
+
+    async fn start_mock_server(mock: MockTmuxOps) -> std::net::SocketAddr {
+        let server = RpcServer::with_backend("127.0.0.1:0", mock);
+        let bound = server.bind().await.unwrap();
+        let addr = bound.local_addr();
+        tokio::spawn(async move {
+            let _ = bound.serve().await;
+        });
+        addr
+    }
+
+    async fn start_test_server() -> std::net::SocketAddr {
+        start_mock_server(MockTmuxOps::new()).await
+    }
+
+    async fn send_request(stream: &mut TcpStream, req: &serde_json::Value) -> serde_json::Value {
+        let bytes = serde_json::to_vec(req).unwrap();
+        write_message(stream, &bytes).await.unwrap();
+        let resp_bytes = read_message(stream).await.unwrap();
+        serde_json::from_slice(&resp_bytes).unwrap()
+    }
+
+    // ── Codec ─────────────────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn read_write_message_roundtrip() {
@@ -444,23 +651,7 @@ mod tests {
         assert_eq!(received, payload);
     }
 
-    // Helper: start a server bound to a random port, return its addr.
-    async fn start_test_server() -> std::net::SocketAddr {
-        let server = RpcServer::new("127.0.0.1:0");
-        let bound = server.bind().await.unwrap();
-        let addr = bound.local_addr();
-        tokio::spawn(async move {
-            let _ = bound.serve().await;
-        });
-        addr
-    }
-
-    async fn send_request(stream: &mut TcpStream, req: &serde_json::Value) -> serde_json::Value {
-        let bytes = serde_json::to_vec(req).unwrap();
-        write_message(stream, &bytes).await.unwrap();
-        let resp_bytes = read_message(stream).await.unwrap();
-        serde_json::from_slice(&resp_bytes).unwrap()
-    }
+    // ── Health ────────────────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn health_request_returns_ok_true() {
@@ -470,6 +661,8 @@ mod tests {
         assert_eq!(resp["ok"], true);
         assert!(resp.get("error").is_none());
     }
+
+    // ── StreamSessionEvents ───────────────────────────────────────────────────
 
     #[tokio::test]
     async fn stream_session_events_returns_internal_error() {
@@ -481,26 +674,20 @@ mod tests {
         )
         .await;
         assert_eq!(resp["error"], "internal");
+        assert!(
+            resp["message"].as_str().unwrap().contains("streaming"),
+            "message should mention 'streaming', got: {}",
+            resp["message"]
+        );
     }
 
-    #[tokio::test]
-    async fn get_session_unknown_uuid_returns_not_found() {
-        let addr = start_test_server().await;
-        let mut stream = TcpStream::connect(addr).await.unwrap();
-        let resp = send_request(
-            &mut stream,
-            &serde_json::json!({"op": "GetSession", "uuid": "nonexistent-uuid-xxxx"}),
-        )
-        .await;
-        assert_eq!(resp["error"], "not_found");
-    }
+    // ── CreateSession ─────────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn create_session_after_shutdown_returns_internal_error() {
-        let server = RpcServer::new("127.0.0.1:0");
+        let server = RpcServer::with_backend("127.0.0.1:0", MockTmuxOps::new());
         let bound = server.bind().await.unwrap();
         let addr = bound.local_addr();
-        // Set the shutdown flag before spawning
         bound.shutdown_flag.store(true, Ordering::SeqCst);
         tokio::spawn(async move {
             let _ = bound.serve().await;
@@ -522,5 +709,673 @@ mod tests {
         .await;
         assert_eq!(resp["error"], "internal");
         assert!(resp["message"].as_str().unwrap().contains("shutting down"));
+    }
+
+    #[tokio::test]
+    async fn create_session_tmux_success_returns_correct_fields() {
+        let addr = start_test_server().await;
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let resp = send_request(
+            &mut stream,
+            &serde_json::json!({
+                "op": "CreateSession",
+                "uuid": "uuid-1",
+                "shortname": "my-session",
+                "repo_slug": "my-repo",
+                "branch": "main",
+                "workdir_parent": "/home/user/.mux/uuid-1",
+                "repo_leaf": "my-repo"
+            }),
+        )
+        .await;
+        assert!(resp.get("error").is_none(), "expected success, got error: {resp}");
+        assert_eq!(resp["uuid"], "uuid-1");
+        assert_eq!(resp["shortname"], "my-session");
+        // tmux_name must be "mux-<shortname>"
+        assert_eq!(resp["tmux_name"], "mux-my-session");
+    }
+
+    #[tokio::test]
+    async fn create_session_tmux_name_has_mux_prefix() {
+        let mock = MockTmuxOps::new();
+        let calls = Arc::clone(&mock.new_session_calls);
+        let addr = start_mock_server(mock).await;
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        send_request(
+            &mut stream,
+            &serde_json::json!({
+                "op": "CreateSession",
+                "uuid": "u1",
+                "shortname": "foo",
+                "repo_slug": "r",
+                "branch": "main",
+                "workdir_parent": "/tmp/p",
+                "repo_leaf": "leaf"
+            }),
+        )
+        .await;
+        let issued = calls.lock().unwrap();
+        assert_eq!(issued.len(), 1, "new_session called once");
+        assert_eq!(issued[0].0, "mux-foo", "tmux session name must be 'mux-<shortname>'");
+    }
+
+    #[tokio::test]
+    async fn create_session_workdir_is_parent_slash_leaf() {
+        let mock = MockTmuxOps::new();
+        let calls = Arc::clone(&mock.new_session_calls);
+        let addr = start_mock_server(mock).await;
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        send_request(
+            &mut stream,
+            &serde_json::json!({
+                "op": "CreateSession",
+                "uuid": "u2",
+                "shortname": "s",
+                "repo_slug": "r",
+                "branch": "main",
+                "workdir_parent": "/home/user/.mux/u2",
+                "repo_leaf": "my-project"
+            }),
+        )
+        .await;
+        let issued = calls.lock().unwrap();
+        assert_eq!(
+            issued[0].1, "/home/user/.mux/u2/my-project",
+            "workdir must be workdir_parent/repo_leaf"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_session_tmux_failure_returns_tmux_error() {
+        let mock = MockTmuxOps::new().with_new_session_error("tmux: session creation failed");
+        let addr = start_mock_server(mock).await;
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let resp = send_request(
+            &mut stream,
+            &serde_json::json!({
+                "op": "CreateSession",
+                "uuid": "u3",
+                "shortname": "s",
+                "repo_slug": "r",
+                "branch": "main",
+                "workdir_parent": "/tmp",
+                "repo_leaf": "r"
+            }),
+        )
+        .await;
+        assert_eq!(resp["error"], "tmux_error");
+    }
+
+    #[tokio::test]
+    async fn create_session_unknown_field_drops_connection() {
+        let addr = start_test_server().await;
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        // Send a CreateSession with an unknown field — `deny_unknown_fields` causes parse error.
+        // The server drops the connection without sending a response.
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "op": "CreateSession",
+            "uuid": "u",
+            "shortname": "s",
+            "repo_slug": "r",
+            "branch": "main",
+            "workdir_parent": "/tmp",
+            "repo_leaf": "r",
+            "unknown_field": "rejected"
+        }))
+        .unwrap();
+        write_message(&mut stream, &bytes).await.unwrap();
+        // Connection is dropped by server — read should return EOF.
+        let result = read_message(&mut stream).await;
+        assert!(result.is_err(), "server should have dropped the connection");
+    }
+
+    // ── ListSessions ──────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn list_sessions_empty_ownership_map_returns_empty_vec() {
+        let addr = start_test_server().await;
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let resp = send_request(&mut stream, &serde_json::json!({"op": "ListSessions"})).await;
+        assert!(resp.get("error").is_none(), "expected success, got: {resp}");
+        assert_eq!(
+            resp["sessions"].as_array().unwrap().len(),
+            0,
+            "no sessions in map → empty list"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_sessions_registered_session_appears_as_active() {
+        // Create a session, then confirm it appears in ListSessions as Active
+        // (mock returns it in the live list).
+        let mock = MockTmuxOps::new()
+            .with_live_sessions(vec![make_tmux_session("mux-proj")]);
+        let addr = start_mock_server(mock).await;
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+
+        // Register the session first.
+        send_request(
+            &mut stream,
+            &serde_json::json!({
+                "op": "CreateSession",
+                "uuid": "list-uuid",
+                "shortname": "proj",
+                "repo_slug": "my-repo",
+                "branch": "main",
+                "workdir_parent": "/tmp/mux/list-uuid",
+                "repo_leaf": "repo"
+            }),
+        )
+        .await;
+
+        let resp = send_request(&mut stream, &serde_json::json!({"op": "ListSessions"})).await;
+        let sessions = resp["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 1, "one session in map");
+        assert_eq!(sessions[0]["uuid"], "list-uuid");
+        assert_eq!(sessions[0]["shortname"], "proj");
+        assert_eq!(sessions[0]["tmux_name"], "mux-proj");
+        assert_eq!(sessions[0]["status"], "active");
+    }
+
+    #[tokio::test]
+    async fn list_sessions_registered_session_is_dead_when_not_in_tmux() {
+        // tmux reports no live sessions → owned session is Dead.
+        let mock = MockTmuxOps::new(); // empty live_sessions
+        let addr = start_mock_server(mock).await;
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+
+        send_request(
+            &mut stream,
+            &serde_json::json!({
+                "op": "CreateSession",
+                "uuid": "dead-uuid",
+                "shortname": "dead",
+                "repo_slug": "r",
+                "branch": "main",
+                "workdir_parent": "/tmp",
+                "repo_leaf": "r"
+            }),
+        )
+        .await;
+
+        let resp = send_request(&mut stream, &serde_json::json!({"op": "ListSessions"})).await;
+        let sessions = resp["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0]["status"], "dead");
+    }
+
+    // ── GetSession ────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn get_session_unknown_uuid_returns_not_found() {
+        let addr = start_test_server().await;
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let resp = send_request(
+            &mut stream,
+            &serde_json::json!({"op": "GetSession", "uuid": "nonexistent-uuid-xxxx"}),
+        )
+        .await;
+        assert_eq!(resp["error"], "not_found");
+    }
+
+    #[tokio::test]
+    async fn get_session_returns_active_when_tmux_reports_live() {
+        let mock = MockTmuxOps::new()
+            .with_live_sessions(vec![make_tmux_session("mux-alive")]);
+        let addr = start_mock_server(mock).await;
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+
+        send_request(
+            &mut stream,
+            &serde_json::json!({
+                "op": "CreateSession",
+                "uuid": "alive-uuid",
+                "shortname": "alive",
+                "repo_slug": "r",
+                "branch": "main",
+                "workdir_parent": "/tmp",
+                "repo_leaf": "r"
+            }),
+        )
+        .await;
+
+        let resp = send_request(
+            &mut stream,
+            &serde_json::json!({"op": "GetSession", "uuid": "alive-uuid"}),
+        )
+        .await;
+        assert!(resp.get("error").is_none(), "expected success, got: {resp}");
+        assert_eq!(resp["uuid"], "alive-uuid");
+        assert_eq!(resp["shortname"], "alive");
+        assert_eq!(resp["tmux_name"], "mux-alive");
+        assert_eq!(resp["status"], "active");
+    }
+
+    #[tokio::test]
+    async fn get_session_returns_dead_when_tmux_does_not_list_it() {
+        let mock = MockTmuxOps::new(); // empty live sessions
+        let addr = start_mock_server(mock).await;
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+
+        send_request(
+            &mut stream,
+            &serde_json::json!({
+                "op": "CreateSession",
+                "uuid": "gone-uuid",
+                "shortname": "gone",
+                "repo_slug": "r",
+                "branch": "main",
+                "workdir_parent": "/tmp",
+                "repo_leaf": "r"
+            }),
+        )
+        .await;
+
+        let resp = send_request(
+            &mut stream,
+            &serde_json::json!({"op": "GetSession", "uuid": "gone-uuid"}),
+        )
+        .await;
+        assert!(resp.get("error").is_none(), "expected success, got: {resp}");
+        assert_eq!(resp["status"], "dead");
+    }
+
+    // ── KillSession ───────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn kill_session_unknown_uuid_returns_not_owned() {
+        let addr = start_test_server().await;
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let resp = send_request(
+            &mut stream,
+            &serde_json::json!({
+                "op": "KillSession",
+                "uuid": "no-such-uuid",
+                "repo_slug": "any-repo"
+            }),
+        )
+        .await;
+        assert_eq!(resp["error"], "not_owned");
+        assert!(
+            resp["message"].as_str().unwrap().contains("ownership map"),
+            "message should mention ownership map, got: {}",
+            resp["message"]
+        );
+    }
+
+    #[tokio::test]
+    async fn kill_session_repo_slug_mismatch_returns_not_owned() {
+        let addr = start_test_server().await;
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+
+        // Create with repo_slug "correct-repo".
+        send_request(
+            &mut stream,
+            &serde_json::json!({
+                "op": "CreateSession",
+                "uuid": "kill-uuid",
+                "shortname": "s",
+                "repo_slug": "correct-repo",
+                "branch": "main",
+                "workdir_parent": "/tmp",
+                "repo_leaf": "r"
+            }),
+        )
+        .await;
+
+        // Kill with wrong repo_slug.
+        let resp = send_request(
+            &mut stream,
+            &serde_json::json!({
+                "op": "KillSession",
+                "uuid": "kill-uuid",
+                "repo_slug": "wrong-repo"
+            }),
+        )
+        .await;
+        assert_eq!(resp["error"], "not_owned");
+        assert!(
+            resp["message"].as_str().unwrap().contains("mismatch"),
+            "message should mention 'mismatch', got: {}",
+            resp["message"]
+        );
+    }
+
+    #[tokio::test]
+    async fn kill_session_removes_session_from_ownership_map() {
+        let addr = start_test_server().await;
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+
+        send_request(
+            &mut stream,
+            &serde_json::json!({
+                "op": "CreateSession",
+                "uuid": "rm-uuid",
+                "shortname": "s",
+                "repo_slug": "r",
+                "branch": "main",
+                "workdir_parent": "/tmp",
+                "repo_leaf": "r"
+            }),
+        )
+        .await;
+
+        // Kill it.
+        let kill_resp = send_request(
+            &mut stream,
+            &serde_json::json!({"op": "KillSession", "uuid": "rm-uuid", "repo_slug": "r"}),
+        )
+        .await;
+        assert!(kill_resp.get("error").is_none(), "kill should succeed: {kill_resp}");
+
+        // GetSession now returns not_found.
+        let get_resp = send_request(
+            &mut stream,
+            &serde_json::json!({"op": "GetSession", "uuid": "rm-uuid"}),
+        )
+        .await;
+        assert_eq!(get_resp["error"], "not_found");
+
+        // ListSessions returns empty.
+        let list_resp = send_request(&mut stream, &serde_json::json!({"op": "ListSessions"})).await;
+        assert_eq!(list_resp["sessions"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn kill_session_already_dead_in_tmux_counts_as_killed() {
+        // kill_session returns "session not found" — already gone. tmux_killed should be true.
+        let mock = MockTmuxOps::new()
+            .with_kill_session_error("session not found: mux-s");
+        let addr = start_mock_server(mock).await;
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+
+        send_request(
+            &mut stream,
+            &serde_json::json!({
+                "op": "CreateSession",
+                "uuid": "already-dead",
+                "shortname": "s",
+                "repo_slug": "r",
+                "branch": "main",
+                "workdir_parent": "/tmp",
+                "repo_leaf": "r"
+            }),
+        )
+        .await;
+
+        let resp = send_request(
+            &mut stream,
+            &serde_json::json!({"op": "KillSession", "uuid": "already-dead", "repo_slug": "r"}),
+        )
+        .await;
+        assert!(resp.get("error").is_none(), "expected success, got: {resp}");
+        assert_eq!(resp["tmux_killed"], true, "already-dead session must count as killed");
+    }
+
+    #[tokio::test]
+    async fn kill_session_mux_created_removes_workdir() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let workdir = tmp.path().join("repo");
+        std::fs::create_dir_all(&workdir).unwrap();
+        let workdir_parent = tmp.path().to_str().unwrap().to_owned();
+
+        let addr = start_test_server().await;
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+
+        send_request(
+            &mut stream,
+            &serde_json::json!({
+                "op": "CreateSession",
+                "uuid": "wd-uuid",
+                "shortname": "s",
+                "repo_slug": "r",
+                "branch": "main",
+                "workdir_parent": workdir_parent,
+                "repo_leaf": "repo"
+            }),
+        )
+        .await;
+
+        let resp = send_request(
+            &mut stream,
+            &serde_json::json!({"op": "KillSession", "uuid": "wd-uuid", "repo_slug": "r"}),
+        )
+        .await;
+        assert!(resp.get("error").is_none(), "expected success, got: {resp}");
+        assert_eq!(resp["tmux_killed"], true);
+        assert_eq!(resp["workdir_removed"], true, "mux_created workdir must be removed");
+        assert!(!workdir.exists(), "workdir should have been deleted");
+    }
+
+    #[tokio::test]
+    async fn kill_session_workdir_already_gone_is_not_an_error() {
+        // workdir doesn't exist → remove_dir_all returns NotFound → workdir_removed = false.
+        let addr = start_test_server().await;
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+
+        send_request(
+            &mut stream,
+            &serde_json::json!({
+                "op": "CreateSession",
+                "uuid": "missing-wd",
+                "shortname": "s",
+                "repo_slug": "r",
+                "branch": "main",
+                "workdir_parent": "/tmp/this-parent-does-not-exist",
+                "repo_leaf": "repo"
+            }),
+        )
+        .await;
+
+        let resp = send_request(
+            &mut stream,
+            &serde_json::json!({"op": "KillSession", "uuid": "missing-wd", "repo_slug": "r"}),
+        )
+        .await;
+        assert!(resp.get("error").is_none(), "missing workdir must not cause kill error: {resp}");
+        assert_eq!(resp["workdir_removed"], false, "NotFound → workdir_removed is false");
+    }
+
+    // ── Shutdown ──────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn shutdown_returns_ok_response() {
+        let addr = start_test_server().await;
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let resp = send_request(&mut stream, &serde_json::json!({"op": "Shutdown"})).await;
+        assert!(resp.get("error").is_none(), "Shutdown must return ok, got: {resp}");
+        // ShutdownResponse is an empty object on the wire.
+        assert!(resp.is_object());
+    }
+
+    #[tokio::test]
+    async fn shutdown_stops_accept_loop() {
+        // After Shutdown the server breaks its accept loop — new TCP connections are refused.
+        let addr = start_test_server().await;
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let resp = send_request(&mut stream, &serde_json::json!({"op": "Shutdown"})).await;
+        assert!(resp.get("error").is_none(), "shutdown must return ok, got: {resp}");
+
+        // Poll until connect fails — avoids a fixed sleep that can be flaky under load.
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(500);
+        loop {
+            if TcpStream::connect(addr).await.is_err() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "server did not stop accepting connections within 500ms"
+            );
+            tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    // ── CreateSession duplicate UUID ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn create_session_duplicate_uuid_returns_internal_error() {
+        let addr = start_test_server().await;
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+
+        let req = serde_json::json!({
+            "op": "CreateSession",
+            "uuid": "dup-uuid",
+            "shortname": "s",
+            "repo_slug": "r",
+            "branch": "main",
+            "workdir_parent": "/tmp",
+            "repo_leaf": "r"
+        });
+
+        let first = send_request(&mut stream, &req).await;
+        assert!(first.get("error").is_none(), "first create must succeed: {first}");
+
+        let second = send_request(&mut stream, &req).await;
+        assert_eq!(
+            second["error"], "internal",
+            "duplicate uuid must return internal error, got: {second}"
+        );
+        assert!(
+            second["message"].as_str().unwrap().contains("already exists"),
+            "message should mention 'already exists', got: {}",
+            second["message"]
+        );
+    }
+
+    // ── KillSession generic tmux error ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn kill_session_generic_tmux_error_sets_tmux_killed_false() {
+        // A non-"not found" tmux error → tmux_killed=false, but entry is still removed.
+        let mock = MockTmuxOps::new().with_kill_session_error("connection failed");
+        let addr = start_mock_server(mock).await;
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+
+        send_request(
+            &mut stream,
+            &serde_json::json!({
+                "op": "CreateSession",
+                "uuid": "tmux-err-uuid",
+                "shortname": "s",
+                "repo_slug": "r",
+                "branch": "main",
+                "workdir_parent": "/tmp",
+                "repo_leaf": "r"
+            }),
+        )
+        .await;
+
+        let resp = send_request(
+            &mut stream,
+            &serde_json::json!({"op": "KillSession", "uuid": "tmux-err-uuid", "repo_slug": "r"}),
+        )
+        .await;
+        assert!(resp.get("error").is_none(), "kill must still succeed at RPC level: {resp}");
+        assert_eq!(resp["tmux_killed"], false, "generic tmux error → tmux_killed=false");
+
+        // Ownership entry must be removed regardless.
+        let get = send_request(
+            &mut stream,
+            &serde_json::json!({"op": "GetSession", "uuid": "tmux-err-uuid"}),
+        )
+        .await;
+        assert_eq!(get["error"], "not_found", "entry must be removed after kill");
+    }
+
+    // ── ListSessions tmux error ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn list_sessions_tmux_error_returns_tmux_error() {
+        let mock = MockTmuxOps::new().with_list_sessions_error("tmux: no server running");
+        let addr = start_mock_server(mock).await;
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let resp = send_request(&mut stream, &serde_json::json!({"op": "ListSessions"})).await;
+        assert_eq!(resp["error"], "tmux_error", "list_sessions error must propagate: {resp}");
+    }
+
+    #[tokio::test]
+    async fn get_session_list_sessions_error_returns_tmux_error() {
+        let mock = MockTmuxOps::new().with_list_sessions_error("tmux: no server running");
+        let addr = start_mock_server(mock).await;
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+
+        // Use a fresh mock without the error for CreateSession so it succeeds.
+        // Instead, create the entry in this server's ownership map first via a server
+        // that doesn't error on new_session, then test via the error-injecting server.
+        // Simpler: just verify the error path is reachable by calling GetSession on
+        // a known-registered session. But we can't create one here without list_sessions
+        // working (new_session still works). Let's create via a separate connection
+        // to a non-error mock, then verify GetSession on this one hits the error.
+        // Actually: the mock controls list_sessions but not new_session.
+        // Create via this server (new_session is fine), then GetSession triggers list_sessions.
+        let create_resp = send_request(
+            &mut stream,
+            &serde_json::json!({
+                "op": "CreateSession",
+                "uuid": "err-get-uuid",
+                "shortname": "s",
+                "repo_slug": "r",
+                "branch": "main",
+                "workdir_parent": "/tmp",
+                "repo_leaf": "r"
+            }),
+        )
+        .await;
+        assert!(create_resp.get("error").is_none(), "create must succeed: {create_resp}");
+
+        let get = send_request(
+            &mut stream,
+            &serde_json::json!({"op": "GetSession", "uuid": "err-get-uuid"}),
+        )
+        .await;
+        assert_eq!(get["error"], "tmux_error", "list_sessions error must propagate via GetSession: {get}");
+    }
+
+    // ── ListSessions multiple sessions ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn list_sessions_multiple_with_mixed_status() {
+        // Two sessions in ownership map; one is live in tmux, one is dead.
+        let mock = MockTmuxOps::new()
+            .with_live_sessions(vec![make_tmux_session("mux-alive")]);
+        let addr = start_mock_server(mock).await;
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+
+        send_request(
+            &mut stream,
+            &serde_json::json!({
+                "op": "CreateSession",
+                "uuid": "uuid-alive",
+                "shortname": "alive",
+                "repo_slug": "r",
+                "branch": "main",
+                "workdir_parent": "/tmp",
+                "repo_leaf": "r"
+            }),
+        )
+        .await;
+        send_request(
+            &mut stream,
+            &serde_json::json!({
+                "op": "CreateSession",
+                "uuid": "uuid-dead",
+                "shortname": "dead",
+                "repo_slug": "r",
+                "branch": "main",
+                "workdir_parent": "/tmp",
+                "repo_leaf": "r2"
+            }),
+        )
+        .await;
+
+        let resp = send_request(&mut stream, &serde_json::json!({"op": "ListSessions"})).await;
+        let sessions = resp["sessions"].as_array().expect("sessions array");
+        assert_eq!(sessions.len(), 2, "both sessions must appear");
+
+        let alive = sessions.iter().find(|s| s["uuid"] == "uuid-alive").expect("alive entry");
+        let dead = sessions.iter().find(|s| s["uuid"] == "uuid-dead").expect("dead entry");
+        assert_eq!(alive["status"], "active", "mux-alive is in the live list");
+        assert_eq!(dead["status"], "dead", "mux-dead is not in the live list");
     }
 }
