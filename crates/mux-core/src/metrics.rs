@@ -1,7 +1,8 @@
 /// Timing and diagnostic data collected during a `mux create` flow.
 ///
-/// This is a plain data struct — tracing/observability integration is wired
-/// up in a later task once the tracing crate is available.
+/// The fields mirror the `create_flow` tracing event emitted by `run_create`.
+/// Used for structured consumption via the event bus (`BusEvent::CreateFlow`)
+/// when the CLI has access to a bus instance.
 #[derive(Debug, Default, Clone)]
 pub struct CreateFlowMetrics {
     /// Total wall-clock duration of the create operation, in milliseconds.

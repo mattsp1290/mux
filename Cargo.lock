@@ -520,6 +520,7 @@ name = "mux-agent"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "mux-core",
  "mux-rpc",
  "mux-tmux",
  "serde_json",
@@ -560,6 +561,8 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
+ "tokio",
+ "tracing",
  "uuid",
 ]
 

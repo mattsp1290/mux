@@ -90,6 +90,9 @@ pub struct CreateResult {
 /// `tokio::task::spawn_blocking`; the only async operation is the RPC in Step 9.
 pub async fn run_create<S: SshHost>(ctx: CreateContext<'_, S>) -> Result<CreateResult, MuxError> {
     let now = unix_now();
+    let flow_start = std::time::Instant::now();
+    // Set after the clone command completes; remains None if an earlier step fails.
+    let git_clone_duration_ms;
 
     // ── Preconditions ─────────────────────────────────────────────────────────
 
@@ -233,6 +236,11 @@ pub async fn run_create<S: SshHost>(ctx: CreateContext<'_, S>) -> Result<CreateR
         if sock_ok {
             mux_core::types::TransportMode::Streamlocal
         } else {
+            // Streamlocal socket not present — falling back to TCP.
+            tracing::debug!(
+                host = ctx.host.alias.as_str(),
+                "transport probe: no streamlocal socket, using tcp"
+            );
             let port = port_str.1.trim().parse::<u16>().unwrap_or(0);
             if port > 0 {
                 mux_core::types::TransportMode::Tcp
@@ -301,6 +309,7 @@ pub async fn run_create<S: SshHost>(ctx: CreateContext<'_, S>) -> Result<CreateR
         sh_quote(&workdir_str),
     );
 
+    let clone_start = std::time::Instant::now();
     let (clone_code, _, clone_stderr) = match ctx.ssh.run(&clone_cmd) {
         Ok(r) => r,
         Err(e) => {
@@ -309,10 +318,18 @@ pub async fn run_create<S: SshHost>(ctx: CreateContext<'_, S>) -> Result<CreateR
             return Err(e);
         }
     };
+    git_clone_duration_ms = clone_start.elapsed().as_millis() as u64;
     if clone_code != 0 {
         cancel_reservation(ctx.conn, &uuid);
         // Attempt cleanup (best-effort, ignore errors).
         let _ = ctx.ssh.run(&format!("rm -rf {}", sh_quote(&workdir_parent_str)));
+        tracing::info!(
+            create_duration_ms = flow_start.elapsed().as_millis() as u64,
+            git_clone_duration_ms,
+            host = ctx.host.alias.as_str(),
+            error_category = "git_clone_failed",
+            "create_flow"
+        );
         return Err(MuxError::GitCloneFailed {
             exit_code: clone_code,
             stderr: truncate_stderr(&clone_stderr),
@@ -369,6 +386,13 @@ pub async fn run_create<S: SshHost>(ctx: CreateContext<'_, S>) -> Result<CreateR
     .map_err(MuxError::Other)?;
 
     // ── Done ──────────────────────────────────────────────────────────────────
+
+    tracing::info!(
+        create_duration_ms = flow_start.elapsed().as_millis() as u64,
+        git_clone_duration_ms,
+        host = ctx.host.alias.as_str(),
+        "create_flow"
+    );
 
     Ok(CreateResult {
         uuid,
