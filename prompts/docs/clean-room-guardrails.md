@@ -49,9 +49,9 @@ must be escalated (open a PR against the spec docs) before implementing. See doc
 ## Invariants that must never be relaxed
 
 These invariants from the spec protect data safety and security:
-- `docs/02 §Workdir safety`: Never remove a workdir that does not match `$MUX_HOME/<uuid>/<repo-leaf>` without symlinks.
+- `docs/02 §Workdir safety`: Never remove a workdir unless its path matches `$MUX_HOME/<uuid>/<repo-leaf>` exactly AND contains no symlink components.
 - `docs/04 §TOFU`: Never silently update a stored fingerprint on mismatch. Always abort.
-- `docs/04 §TOFU`: Never skip TOFU for state-changing operations (create, kill).
+- `docs/04 §TOFU`: Never skip TOFU for state-changing operations (create, kill, attach).
 - `docs/07 §Kill flow`: Never mutate session state before TOFU verification.
 - `docs/07 §Create flow`: Never leave a partial session row in the DB. Always roll back.
 

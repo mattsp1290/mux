@@ -8,7 +8,7 @@ Linked from: prompts/docs/README.md
 
 - Binary name: `mux`
 - State directory: `$MUX_HOME` if set, else `~/.mux`
-- If `MUX_HOME` unset and home directory cannot be determined: every command exits with `mux: <reason>` to stderr, exit code 1
+- If `MUX_HOME` unset and home directory cannot be determined: every command exits with `mux: <reason>` to stderr. Exit code is **1** (interpretation: treated as an environment/user error; docs/01 does not specify — see clean-room-guardrails.md §When the spec is ambiguous)
 - All user-facing errors are prefixed `mux: `
 - Exit codes: `0` = success, `1` = user/host/remote error, `2` = internal/unexpected error
 
@@ -50,7 +50,7 @@ Cascade-removes: fingerprints, agent_versions, sessions for that host.
 | home | `echo $HOME` |
 | tmux version ≥ 3.0 | `tmux -V` |
 
-Persists: arch, home, transport_mode, fingerprint, tmux_version.  
+Persists: arch, home, `hosts.transport` (column name; note: `sessions.transport_mode` is a separate column), fingerprint, tmux_version, tool availability.  
 TOFU: interactive if first contact; silent if fingerprint matches.  
 Idempotent: unchanged trust does not re-prompt.
 
@@ -65,7 +65,8 @@ Selects binary via `MUX_AGENT_BINARY` env var or built-in lookup.
 Upload path: `<home>/.mux/bin/mux-agent`.  
 Post-upload: verify size + hash; `chmod +x`.  
 Agent lifecycle: graceful stop first, kill fallback if needed.  
-Persists version to `agent_versions` only after verified upload.
+Persists version to `agent_versions` only after verified upload.  
+Version row is **upserted**: `INSERT INTO agent_versions ... ON CONFLICT(host_id) DO UPDATE SET version=..., deployed_at=...` (the UNIQUE constraint on `host_id` enforces one row per host).
 
 ### `mux agent logs <alias> [--follow]`
 
