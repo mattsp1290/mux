@@ -123,6 +123,27 @@ pub fn get_by_uuid(conn: &Connection, uuid: &str) -> Result<Option<Session>> {
     .context("get session by uuid")
 }
 
+/// Fetch all activated sessions matching a shortname, across all hosts.
+///
+/// Used by selector resolution when the caller has no host context.
+/// Returns multiple rows when the same shortname exists on different hosts —
+/// callers must decide how to handle ambiguity.
+pub fn get_by_shortname_global(conn: &Connection, shortname: &str) -> Result<Vec<Session>> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {SESSION_COLUMNS} FROM sessions \
+             WHERE shortname = ?1 AND tmux_name IS NOT NULL \
+             ORDER BY created_at ASC"
+        ))
+        .context("prepare get_by_shortname_global")?;
+    let rows = stmt
+        .query_map(params![shortname], map_session)
+        .context("query get_by_shortname_global")?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("collect get_by_shortname_global rows")?;
+    Ok(rows)
+}
+
 /// Fetch an activated session by host + shortname (excludes in-flight reservations).
 pub fn get_by_shortname(
     conn: &Connection,
@@ -409,6 +430,49 @@ mod tests {
         // Oldest first (created_at ASC per docs/07 §List flow step 4)
         assert_eq!(sessions[0].uuid, "uuid-a");
         assert_eq!(sessions[1].uuid, "uuid-b");
+    }
+
+    #[test]
+    fn get_by_shortname_global_excludes_in_flight_and_orders_by_created_at() {
+        let (_dir, store) = open_store();
+        let conn = store.conn();
+        let host_id = insert_host(conn);
+        // Reserve but do NOT activate — must not appear in global search.
+        reserve(conn, &ReserveParams {
+            uuid: "inflight-1",
+            host_id,
+            shortname: "shared",
+            repo_slug: "o/r",
+            branch: "main",
+            created_at: 1_000_000,
+        }).unwrap();
+        // Activate two sessions with the same shortname on different hosts.
+        let host2 = crate::host_repo::insert(conn, "host2", "u", "2.2.2.2", 22, 1_000_000).unwrap();
+        reserve(conn, &ReserveParams {
+            uuid: "active-old",
+            host_id,
+            shortname: "shared",
+            repo_slug: "o/r",
+            branch: "main",
+            created_at: 1_000_001,
+        }).unwrap();
+        activate(conn, "active-old", "mux-shared", "/w/a", "tcp", 1_000_002).unwrap();
+        reserve(conn, &ReserveParams {
+            uuid: "active-new",
+            host_id: host2,
+            shortname: "shared",
+            repo_slug: "o/r",
+            branch: "main",
+            created_at: 1_000_003,
+        }).unwrap();
+        activate(conn, "active-new", "mux-shared2", "/w/b", "tcp", 1_000_004).unwrap();
+
+        let rows = get_by_shortname_global(conn, "shared").unwrap();
+        // In-flight row must be excluded; only the two activated rows returned.
+        assert_eq!(rows.len(), 2);
+        // Ordered by created_at ASC.
+        assert_eq!(rows[0].uuid, "active-old");
+        assert_eq!(rows[1].uuid, "active-new");
     }
 
     #[test]

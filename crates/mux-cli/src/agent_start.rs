@@ -168,6 +168,23 @@ impl<E: RemoteExec> AgentStarter<E> {
         truncate_stderr(&stdout)
     }
 
+    /// Connect to an existing agent without starting one.
+    ///
+    /// Returns `Ok(Some(urls))` if a live agent is found, `Ok(None)` if not running.
+    /// Used by operations (e.g. `mux kill`) that must not start a new agent as a side effect.
+    pub fn probe_existing(&self) -> Result<Option<AgentUrls>, MuxError> {
+        match self.read_lock()? {
+            None => Ok(None),
+            Some((pid, tcp_url)) => {
+                if self.is_process_alive(pid) {
+                    Ok(Some(AgentUrls::from_tcp_url(tcp_url)?))
+                } else {
+                    Ok(None)
+                }
+            }
+        }
+    }
+
     /// Ensure the agent is running. Returns the agent URLs.
     ///
     /// This is the main entry point for the agent start protocol.
