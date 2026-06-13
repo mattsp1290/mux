@@ -492,6 +492,7 @@ dependencies = [
  "mux-ssh",
  "mux-state",
  "predicates",
+ "rusqlite",
  "serde",
  "tempfile",
  "tokio",
