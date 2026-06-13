@@ -732,7 +732,7 @@ mod tests {
         let (_store_dir, store) = open_store();
         let conn = store.conn();
         let host = insert_host_with_probe(conn, "prod");
-        let (_env_lock, _bin_dir, content, _hash, _guard) = setup_fake_binary();
+        let (_env_lock, _bin_dir, _content, _hash, _guard) = setup_fake_binary();
 
         // Remote reports wrong size.
         let responses = vec![
