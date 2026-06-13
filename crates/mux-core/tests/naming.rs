@@ -108,6 +108,7 @@ fn branch_shortname_truncates_at_hyphen_boundary() {
     let result = shortname_for_branch(&repo, &branch);
     assert!(result.len() <= MAX_SHORTNAME_BYTES);
     assert!(!result.ends_with('-'), "trailing hyphen after truncation");
+    assert_eq!(result, "r".repeat(62), "should cut at the joining hyphen");
 }
 
 // ── Main-branch shortname (docs/02 "Main-branch shortname") ──────────────────
@@ -167,10 +168,11 @@ fn tmux_session_name_prepends_mux_prefix() {
 
 #[test]
 fn tmux_session_name_pipeline_from_main_shortname() {
-    // Full pipeline: repo leaf + adj + noun → shortname → tmux name
-    let shortname = shortname_for_main("mux", "happy", "panda");
+    // Full pipeline: repo leaf + adj + noun → shortname → tmux name.
+    // Uses ADJECTIVES[0]="brave" and NOUNS[0]="ant" — both real word-list entries.
+    let shortname = shortname_for_main("mux", ADJECTIVES[0], NOUNS[0]);
     let tmux_name = tmux_session_name(&shortname);
-    assert_eq!(tmux_name, "mux-mux-happy-panda");
+    assert_eq!(tmux_name, "mux-mux-brave-ant");
     assert!(tmux_name.starts_with("mux-"));
 }
 
@@ -218,11 +220,11 @@ fn truncate_hard_truncates_when_no_hyphen() {
 
 #[test]
 fn truncate_does_not_split_multibyte_char() {
-    // 'é' is 2 bytes; ensure we don't cut inside it.
+    // 'é' is 2 bytes; ensure the whole multi-byte char is dropped, not split.
     let s = "a".repeat(123) + "é"; // 125 bytes total
     let result = truncate_shortname(&s);
     assert!(result.len() <= MAX_SHORTNAME_BYTES);
-    assert!(std::str::from_utf8(result.as_bytes()).is_ok(), "result must be valid UTF-8");
+    assert_eq!(result, "a".repeat(123), "multi-byte char must be dropped whole");
 }
 
 // ── Collision-handling suffix (docs/02 "Non-main-branch shortname") ───────────
@@ -248,7 +250,7 @@ fn suffix_attempt_10_appends_10() {
 fn suffix_stays_within_max_when_base_is_full_length() {
     let base = "a".repeat(MAX_SHORTNAME_BYTES);
     let result = shortname_with_suffix(&base, 2);
-    assert!(result.len() <= MAX_SHORTNAME_BYTES, "len={}", result.len());
+    assert_eq!(result.len(), MAX_SHORTNAME_BYTES, "result should use the full 124 bytes");
     assert!(result.ends_with("-2"), "suffix must be present");
 }
 
@@ -406,4 +408,37 @@ fn is_safe_to_remove_false_when_leaf_is_symlink() {
     std::os::unix::fs::symlink(&real_target, &leaf_link).unwrap();
 
     assert!(!is_safe_to_remove(&leaf_link, mux_home));
+}
+
+// ── Additional coverage for reviewed gaps ─────────────────────────────────────
+
+#[test]
+fn branch_shortname_empty_components_fall_back_to_session() {
+    // docs/02 "Non-main-branch shortname": when both leaf and branch sanitize to empty,
+    // the fallback shortname "session" is returned.
+    assert_eq!(shortname_for_branch("///", "---"), "session");
+    // Only leaf sanitizes to empty — result is the sanitized branch.
+    assert_eq!(shortname_for_branch("///", "feature/x"), "feature-x");
+    // Only branch sanitizes to empty — result is the sanitized leaf.
+    assert_eq!(shortname_for_branch("myrepo", "///"), "myrepo");
+}
+
+#[test]
+fn workdir_dot_in_leaf_position_is_imported() {
+    // Symmetric to the ".." test: "." is a current-dir Component, not Normal, so
+    // $MUX_HOME/<uuid>/. must also be Imported.
+    let mux_home = Path::new("/home/user/.mux");
+    let traversal = mux_home.join(VALID_UUID).join(".");
+    assert_eq!(
+        classify_workdir(&traversal, mux_home),
+        WorkdirClassification::Imported,
+        "$MUX_HOME/<uuid>/. must not be MuxCreated"
+    );
+}
+
+#[test]
+#[should_panic(expected = "attempt is 1-based, got 0")]
+fn suffix_attempt_0_panics() {
+    // shortname_with_suffix is 1-based; 0 is a programming error and panics in debug.
+    shortname_with_suffix("my-session", 0);
 }
