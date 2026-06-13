@@ -127,12 +127,20 @@ pub fn parse_lock_pid(json: &str) -> Option<u64> {
 }
 
 /// Parse the `tcp_url` field from the agent lock JSON `{"pid":N,"tcp_url":"tcp://..."}`.
+///
+/// Returns `None` for a missing key, a closing-quote parse failure, or an empty value.
+/// The returned string is the raw substring between quotes with no JSON-escape decoding;
+/// the canonical single-line lock format never contains backslash sequences.
 pub fn parse_lock_tcp_url(json: &str) -> Option<String> {
     let key = "\"tcp_url\":\"";
     let start = json.find(key)? + key.len();
     let rest = &json[start..];
     let end = rest.find('"')?;
-    Some(rest[..end].to_owned())
+    let url = &rest[..end];
+    if url.is_empty() {
+        return None;
+    }
+    Some(url.to_owned())
 }
 
 /// Parse sha256 hex digest from either `sha256sum` or `openssl dgst -sha256` output.
@@ -272,38 +280,47 @@ pub fn run_agent_deploy<S: DeployHost>(ctx: DeployContext<'_, S>) -> Result<()> 
 /// Run `mux agent logs` for the given host.
 ///
 /// Reads the last 200 lines from `<home>/.mux/agent.log` over SSH.
-/// With `follow = true`, uses `tail -f` semantics (command does not return until
-/// the remote process is interrupted; supported by a streaming SSH executor).
+/// A missing log file is not an error — returns an empty string.
 ///
-/// Returns the captured output. Callers are responsible for printing it.
-/// A missing or empty log file is not an error — returns empty string.
+/// `follow = true` is rejected until a streaming SSH executor is available; passing
+/// `tail -f` through a buffered `RemoteExec::run` would block forever and never return.
 pub fn run_agent_logs<S: RemoteExec>(home: &str, follow: bool, ssh: &S) -> Result<String> {
+    if follow {
+        bail!("mux agent logs --follow: streaming not yet supported (requires SSH streaming transport)");
+    }
     let log_path = format!("{home}/.mux/agent.log");
-    let cmd = if follow {
-        format!("tail -f -n 200 {}", sh_quote(&log_path))
-    } else {
-        format!("tail -n 200 {}", sh_quote(&log_path))
-    };
+    let qp = sh_quote(&log_path);
+    // `test -f` gates `tail` on file existence: exit 1 with no stderr means the log
+    // hasn't been created yet (agent never started). A real error — permission denied,
+    // transport failure — causes `tail` to write to stderr, distinguishing the cases.
+    let cmd = format!("test -f {qp} && tail -n 200 {qp}");
 
     let (code, stdout, stderr) = ssh.run(&cmd).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     if code != 0 {
-        // tail exits non-zero when the file does not exist; treat as empty log.
-        if stdout.trim().is_empty() {
-            return Ok(String::new());
+        let err_msg = stderr.trim();
+        if !err_msg.is_empty() {
+            bail!("mux agent logs: {err_msg}");
         }
-        bail!("mux agent logs: {}", stderr.trim());
+        // test -f exited non-zero with no stderr → log file not yet created.
+        return Ok(String::new());
     }
     Ok(stdout)
 }
 
 /// Run `mux agent stop` for the given host.
 ///
-/// 1. Read lock file for PID and tcp_url.
+/// 1. Read lock file for PID.
 /// 2. If no lock or process dead → success (idempotent).
-/// 3. If tcp_url present → attempt graceful Shutdown RPC.
-/// 4. On RPC failure (or no tcp_url) → SIGTERM → poll → SIGKILL fallback.
-pub async fn run_agent_stop<S: RemoteExec>(home: &str, ssh: &S) -> Result<()> {
+/// 3. SIGTERM → poll up to ~3 s → SIGKILL fallback.
+/// 4. Final `kill -0` confirms the process is gone; surfaces an error if not.
+///
+/// # Note: RPC Shutdown not yet wired
+/// The lock file may contain a `tcp_url`, but the agent binds its RPC port to the
+/// *remote* host's loopback interface. Without an SSH port-forward we cannot reach it
+/// from the controller. RPC-based graceful shutdown will be added in a future iteration
+/// when SSH tunneling is available; for now SIGTERM→SIGKILL is the sole stop path.
+pub fn run_agent_stop<S: RemoteExec>(home: &str, ssh: &S) -> Result<()> {
     let lock_path = format!("{home}/.mux/agent.lock");
 
     // 1. Read lock file (best-effort).
@@ -316,9 +333,9 @@ pub async fn run_agent_stop<S: RemoteExec>(home: &str, ssh: &S) -> Result<()> {
         return Ok(());
     }
 
-    // Bound PID to kernel max; reject bogus values from a hostile lock.
+    // Bound PID to kernel max; reject bogus values from a hostile lock file.
     let pid = match parse_lock_pid(&stdout) {
-        Some(p) if (1..=4_194_304).contains(&p) => p,
+        Some(p) if (1..=MAX_PID).contains(&p) => p,
         _ => {
             println!("mux agent stop: no agent running");
             return Ok(());
@@ -334,46 +351,37 @@ pub async fn run_agent_stop<S: RemoteExec>(home: &str, ssh: &S) -> Result<()> {
         return Ok(());
     }
 
-    // 3. Try Shutdown RPC if transport is known.
-    let used_rpc = if let Some(tcp_url) = parse_lock_tcp_url(&stdout) {
-        if let Ok(urls) = crate::agent_start::AgentUrls::from_tcp_url(&tcp_url) {
-            let rpc = mux_rpc::client::RpcClient::tcp("127.0.0.1", urls.tcp_port());
-            match rpc.shutdown().await {
-                Ok(_) => {
-                    println!("mux agent stop: agent stopped via RPC");
-                    true
-                }
-                Err(e) => {
-                    eprintln!("mux agent stop: RPC shutdown failed ({e}); falling back to process kill");
-                    false
-                }
-            }
-        } else {
-            false
-        }
-    } else {
-        false
-    };
+    // 3. SIGTERM → poll → SIGKILL.
+    let _ = ssh.run(&format!("kill -TERM {pid} 2>/dev/null"));
+    let (alive_after, _, _) = ssh
+        .run(&format!(
+            "for _i in 1 2 3; do kill -0 {pid} 2>/dev/null || exit 0; sleep 1; done; kill -0 {pid} 2>/dev/null"
+        ))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    // 4. If RPC was not used (or failed), send SIGTERM then SIGKILL.
-    if !used_rpc {
-        let _ = ssh.run(&format!("kill -TERM {pid} 2>/dev/null"));
-        let (alive_after, _, _) = ssh
-            .run(&format!(
-                "for _i in 1 2 3; do kill -0 {pid} 2>/dev/null || exit 0; sleep 1; done; kill -0 {pid} 2>/dev/null"
-            ))
+    if alive_after == 0 {
+        let _ = ssh.run(&format!("kill -KILL {pid} 2>/dev/null"));
+        // 4. Verify the process is actually dead — SIGKILL can fail (e.g. zombie owned by
+        //    init, kernel-uninterruptible state). Surface an honest error rather than
+        //    printing "agent stopped" when the process is still alive.
+        let (still_alive, _, _) = ssh
+            .run(&format!("kill -0 {pid} 2>/dev/null"))
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-        if alive_after == 0 {
-            let _ = ssh.run(&format!("kill -KILL {pid} 2>/dev/null"));
+        if still_alive == 0 {
+            bail!("mux agent stop: agent (pid {pid}) may still be running after SIGKILL");
         }
-        println!("mux agent stop: agent stopped");
     }
 
+    println!("mux agent stop: agent stopped");
     Ok(())
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
+
+/// Sanity ceiling for PID values parsed from remote lock files.
+/// Matches the default Linux `kernel.pid_max`; rejects obviously bogus values
+/// from hostile or corrupted lock files without hard-coding a kernel dependency.
+const MAX_PID: u64 = 4_194_304;
 
 /// POSIX single-quote escaping: wraps `s` in `'...'` and escapes embedded `'`.
 fn sh_quote(s: &str) -> String {
@@ -408,7 +416,7 @@ fn stop_agent_if_running<S: RemoteExec>(ssh: &S, lock_path: &str) -> Result<()> 
     // Bound the PID to the kernel max; reject obviously bogus values from a
     // hostile or corrupted remote lock file.
     let pid = match parse_lock_pid(&stdout) {
-        Some(p) if (1..=4_194_304).contains(&p) => p,
+        Some(p) if (1..=MAX_PID).contains(&p) => p,
         _ => return Ok(()),
     };
 
@@ -992,22 +1000,31 @@ mod tests {
 
     #[test]
     fn logs_no_file_returns_empty() {
-        // tail exits 1 when file not found; empty stdout → not an error.
-        let ssh = MockRemoteExec::new(vec![(1, "", "No such file or directory")]);
+        // test -f exits 1 with no stderr when the file doesn't exist yet.
+        let ssh = MockRemoteExec::new(vec![(1, "", "")]);
         let output = run_agent_logs("/home/user", false, &ssh).unwrap();
         assert!(output.is_empty(), "missing log should yield empty string, got: {output:?}");
     }
 
     #[test]
-    fn logs_follow_sends_tail_f_command() {
-        let ssh = MockRemoteExec::new(vec![(0, "some output", "")]);
-        let cmds = Rc::clone(&ssh.commands);
-        run_agent_logs("/home/user", true, &ssh).unwrap();
-        let issued = cmds.borrow();
+    fn logs_permission_error_propagates() {
+        // test -f succeeds, tail fails with permission denied in stderr → real error.
+        let ssh = MockRemoteExec::new(vec![(1, "", "Permission denied")]);
+        let err = run_agent_logs("/home/user", false, &ssh).unwrap_err();
         assert!(
-            issued[0].contains("tail -f"),
-            "follow mode must use tail -f, got: {:?}",
-            issued[0]
+            err.to_string().contains("Permission denied"),
+            "permission error must propagate, got: {err}"
+        );
+    }
+
+    #[test]
+    fn logs_follow_returns_not_supported_error() {
+        // --follow is gated until a streaming SSH executor exists.
+        let ssh = MockRemoteExec::new(vec![]);
+        let err = run_agent_logs("/home/user", true, &ssh).unwrap_err();
+        assert!(
+            err.to_string().contains("not yet supported"),
+            "--follow must return a clear 'not yet supported' error, got: {err}"
         );
     }
 
@@ -1026,20 +1043,20 @@ mod tests {
 
     // ── run_agent_stop ────────────────────────────────────────────────────────
 
-    #[tokio::test]
-    async fn stop_no_lock_is_noop() {
+    #[test]
+    fn stop_no_lock_is_noop() {
         // No lock file — cat exits 1, stdout empty.
         let ssh = MockRemoteExec::new(vec![(1, "", "")]);
         let cmds = Rc::clone(&ssh.commands);
-        run_agent_stop("/home/user", &ssh).await.unwrap();
+        run_agent_stop("/home/user", &ssh).unwrap();
         let issued = cmds.borrow();
         // Only one command: cat the lock file.
         assert_eq!(issued.len(), 1, "only lock-read command should be issued: {issued:?}");
         assert!(issued[0].contains("agent.lock"), "expected lock-file read, got: {:?}", issued[0]);
     }
 
-    #[tokio::test]
-    async fn stop_dead_process_is_noop() {
+    #[test]
+    fn stop_dead_process_is_noop() {
         // Lock file exists but process is dead (kill -0 returns non-zero).
         let lock_json = r#"{"pid":12345,"tcp_url":"tcp://127.0.0.1:50001"}"#;
         let ssh = MockRemoteExec::new(vec![
@@ -1047,29 +1064,35 @@ mod tests {
             (1, "", ""),        // kill -0 → no such process
         ]);
         let cmds = Rc::clone(&ssh.commands);
-        run_agent_stop("/home/user", &ssh).await.unwrap();
+        run_agent_stop("/home/user", &ssh).unwrap();
         // Exactly two commands: lock-read + kill-0.
         let issued = cmds.borrow();
         assert_eq!(issued.len(), 2, "only two commands expected: {issued:?}");
         assert!(issued[1].contains("kill -0"), "second cmd must be kill -0: {:?}", issued[1]);
     }
 
-    #[tokio::test]
-    async fn stop_sigterm_is_sufficient() {
-        // Process alive; no tcp_url → fall back to kill; SIGTERM is enough.
-        let lock_json = r#"{"pid":22222}"#; // no tcp_url
+    #[test]
+    fn stop_sigterm_is_sufficient() {
+        // Process alive; SIGTERM is enough — no SIGKILL issued.
+        let lock_json = r#"{"pid":22222}"#;
         let ssh = MockRemoteExec::new(vec![
             (0, lock_json, ""), // cat lock
             (0, "", ""),        // kill -0 → alive
             (0, "", ""),        // kill -TERM
             (1, "", ""),        // poll → agent gone after TERM
         ]);
-        run_agent_stop("/home/user", &ssh).await.unwrap();
+        let cmds = Rc::clone(&ssh.commands);
+        run_agent_stop("/home/user", &ssh).unwrap();
+        let issued = cmds.borrow();
+        // Commands: cat lock, kill -0, kill -TERM, poll. No SIGKILL.
+        assert_eq!(issued.len(), 4, "expected exactly 4 commands: {issued:?}");
+        assert!(issued[2].contains("TERM"), "third command must be SIGTERM: {:?}", issued[2]);
+        assert!(!issued.iter().any(|c| c.contains("KILL")), "SIGKILL must not be issued: {issued:?}");
     }
 
-    #[tokio::test]
-    async fn stop_sigkill_fallback_when_sigterm_insufficient() {
-        // Process survives SIGTERM poll — escalate to SIGKILL.
+    #[test]
+    fn stop_sigkill_fallback_when_sigterm_insufficient() {
+        // Process survives SIGTERM poll — escalate to SIGKILL; final kill -0 confirms dead.
         let lock_json = r#"{"pid":33333}"#;
         let ssh = MockRemoteExec::new(vec![
             (0, lock_json, ""), // cat lock
@@ -1077,9 +1100,10 @@ mod tests {
             (0, "", ""),        // kill -TERM
             (0, "", ""),        // poll → still alive after TERM
             (0, "", ""),        // kill -KILL
+            (1, "", ""),        // kill -0 final check → dead
         ]);
         let cmds = Rc::clone(&ssh.commands);
-        run_agent_stop("/home/user", &ssh).await.unwrap();
+        run_agent_stop("/home/user", &ssh).unwrap();
         let issued = cmds.borrow();
         assert!(
             issued.iter().any(|c| c.contains("KILL")),
@@ -1087,24 +1111,49 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn stop_rpc_fails_falls_back_to_process_kill() {
-        // Lock has a tcp_url but nothing is listening → connection refused → fall back to kill.
-        // Port 59998 is chosen to be almost certainly unoccupied in the test environment.
+    #[test]
+    fn stop_sigkill_fails_returns_error() {
+        // SIGKILL also fails to stop the process → honest error, not silent success.
+        let lock_json = r#"{"pid":55555}"#;
+        let ssh = MockRemoteExec::new(vec![
+            (0, lock_json, ""), // cat lock
+            (0, "", ""),        // kill -0 → alive
+            (0, "", ""),        // kill -TERM
+            (0, "", ""),        // poll → still alive
+            (0, "", ""),        // kill -KILL
+            (0, "", ""),        // kill -0 final check → still alive!
+        ]);
+        let err = run_agent_stop("/home/user", &ssh).unwrap_err();
+        assert!(
+            err.to_string().contains("may still be running"),
+            "must surface honest error when SIGKILL fails: {err}"
+        );
+    }
+
+    #[test]
+    fn stop_with_tcp_url_in_lock_uses_kill_path() {
+        // Even when the lock has a tcp_url, stop uses SIGTERM (no RPC — SSH tunnel not yet
+        // established; the agent's RPC port binds to remote loopback, not local loopback).
         let lock_json = r#"{"pid":44444,"tcp_url":"tcp://127.0.0.1:59998"}"#;
         let ssh = MockRemoteExec::new(vec![
             (0, lock_json, ""), // cat lock
             (0, "", ""),        // kill -0 → alive
-            (0, "", ""),        // kill -TERM (fallback after RPC fails)
+            (0, "", ""),        // kill -TERM
             (1, "", ""),        // poll → agent gone after TERM
         ]);
         let cmds = Rc::clone(&ssh.commands);
-        run_agent_stop("/home/user", &ssh).await.unwrap();
-        // SIGTERM must have been sent (RPC fallback path was taken).
+        run_agent_stop("/home/user", &ssh).unwrap();
         let issued = cmds.borrow();
         assert!(
             issued.iter().any(|c| c.contains("TERM")),
-            "SIGTERM must be issued after RPC failure: {issued:?}"
+            "SIGTERM must be used as the stop mechanism: {issued:?}"
         );
+        // No RPC attempt — no connection to 127.0.0.1:59998.
+        assert_eq!(issued.len(), 4, "expected exactly 4 commands (cat/kill-0/TERM/poll): {issued:?}");
+    }
+
+    #[test]
+    fn parse_lock_tcp_url_empty_returns_none() {
+        assert_eq!(parse_lock_tcp_url(r#"{"pid":1,"tcp_url":""}"#), None);
     }
 }
