@@ -8,8 +8,13 @@ description = "mux SSH trust, TOFU, and transport layer"
 
 [dependencies]
 mux-core = { path = "../mux-core" }
+mux-state = { path = "../mux-state" }
 anyhow.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+rusqlite.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

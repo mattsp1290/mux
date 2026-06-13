@@ -118,6 +118,19 @@ pub enum MuxError {
     #[error("SSH agent forwarding is not available")]
     SshAgentNotForwarded,
 
+    /// SSH private key is encrypted and cannot be used without unlocking.
+    /// Hint: "Run `ssh-add` to unlock the key."
+    #[error("SSH key is encrypted; run `ssh-add` to unlock")]
+    SshKeyEncrypted,
+
+    /// Server host key encountered for first time with no interactive terminal.
+    #[error("TOFU requires an interactive terminal for first-contact verification")]
+    TofuNonInteractive,
+
+    /// User declined the TOFU first-contact trust prompt.
+    #[error("host key rejected by user")]
+    HostKeyRejected,
+
     /// The remote mux-agent returned an application-level error.
     #[error("agent error: {0}")]
     AgentError(String),
@@ -150,6 +163,13 @@ impl MuxError {
             MuxError::HostKeyMismatch => {
                 Some("Use `mux host trust <alias>` to review and rotate the key.")
             }
+            MuxError::SshKeyEncrypted => Some("Run `ssh-add` to unlock the key."),
+            MuxError::TofuNonInteractive => {
+                Some("Run `mux host test <alias>` interactively to establish trust.")
+            }
+            MuxError::HostKeyRejected => {
+                Some("Trust the host first with `mux host test <alias>`.")
+            }
             _ => None,
         }
     }
@@ -163,6 +183,9 @@ impl MuxError {
             MuxError::WorkdirPreExisting(_) => "workdir_pre_existing",
             MuxError::GitCloneFailed { .. } => "git_clone_failed",
             MuxError::SshAgentNotForwarded => "ssh_agent_not_forwarded",
+            MuxError::SshKeyEncrypted => "ssh_key_encrypted",
+            MuxError::TofuNonInteractive => "tofu_non_interactive",
+            MuxError::HostKeyRejected => "host_key_rejected",
             MuxError::SessionAlreadyExists { .. } => "session_already_exists",
             MuxError::ShortnameExhausted => "shortname_exhausted",
             MuxError::RpcError(_) | MuxError::AgentError(_) => "rpc_error",
@@ -192,6 +215,9 @@ impl MuxError {
             | MuxError::ConnectionTimeout(_)
             | MuxError::GitCloneFailed { .. }
             | MuxError::SshAgentNotForwarded
+            | MuxError::SshKeyEncrypted
+            | MuxError::TofuNonInteractive
+            | MuxError::HostKeyRejected
             | MuxError::AgentError(_)
             | MuxError::RpcError(_) => 1,
             MuxError::Other(_) => 2,
@@ -448,6 +474,84 @@ mod tests {
         assert_eq!(MuxError::SshAgentNotForwarded.exit_code(), 1);
     }
 
+    // ── SshKeyEncrypted ──────────────────────────────────────────────────────
+
+    #[test]
+    fn ssh_key_encrypted_display() {
+        let e = MuxError::SshKeyEncrypted;
+        assert!(e.to_string().contains("encrypted"));
+    }
+
+    #[test]
+    fn ssh_key_encrypted_hint() {
+        let e = MuxError::SshKeyEncrypted;
+        assert_eq!(e.hint(), Some("Run `ssh-add` to unlock the key."));
+    }
+
+    #[test]
+    fn ssh_key_encrypted_exit_code() {
+        assert_eq!(MuxError::SshKeyEncrypted.exit_code(), 1);
+    }
+
+    #[test]
+    fn ssh_key_encrypted_category() {
+        assert_eq!(MuxError::SshKeyEncrypted.category(), "ssh_key_encrypted");
+    }
+
+    // ── TofuNonInteractive ───────────────────────────────────────────────────
+
+    #[test]
+    fn tofu_non_interactive_display() {
+        let e = MuxError::TofuNonInteractive;
+        assert!(e.to_string().contains("interactive"));
+    }
+
+    #[test]
+    fn tofu_non_interactive_hint() {
+        let e = MuxError::TofuNonInteractive;
+        assert_eq!(
+            e.hint(),
+            Some("Run `mux host test <alias>` interactively to establish trust.")
+        );
+    }
+
+    #[test]
+    fn tofu_non_interactive_exit_code() {
+        assert_eq!(MuxError::TofuNonInteractive.exit_code(), 1);
+    }
+
+    #[test]
+    fn tofu_non_interactive_category() {
+        assert_eq!(MuxError::TofuNonInteractive.category(), "tofu_non_interactive");
+    }
+
+    // ── HostKeyRejected ──────────────────────────────────────────────────────
+
+    #[test]
+    fn host_key_rejected_display() {
+        let e = MuxError::HostKeyRejected;
+        assert!(e.to_string().contains("rejected"));
+    }
+
+    #[test]
+    fn host_key_rejected_hint() {
+        let e = MuxError::HostKeyRejected;
+        assert_eq!(
+            e.hint(),
+            Some("Trust the host first with `mux host test <alias>`.")
+        );
+    }
+
+    #[test]
+    fn host_key_rejected_exit_code() {
+        assert_eq!(MuxError::HostKeyRejected.exit_code(), 1);
+    }
+
+    #[test]
+    fn host_key_rejected_category() {
+        assert_eq!(MuxError::HostKeyRejected.category(), "host_key_rejected");
+    }
+
     // ── category() ───────────────────────────────────────────────────────────
 
     #[test]
@@ -456,6 +560,9 @@ mod tests {
             "workdir_pre_existing",
             "git_clone_failed",
             "ssh_agent_not_forwarded",
+            "ssh_key_encrypted",
+            "tofu_non_interactive",
+            "host_key_rejected",
             "session_already_exists",
             "shortname_exhausted",
             "rpc_error",
