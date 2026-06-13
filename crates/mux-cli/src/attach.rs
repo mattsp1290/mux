@@ -4,7 +4,7 @@ use anyhow::{bail, Result};
 use rusqlite::Connection;
 
 use mux_ssh::trust::{check_host_key, TrustCheckResult};
-use mux_state::{fingerprint_repo, host_repo};
+use mux_state::host_repo;
 
 use crate::create::SshHost;
 use crate::kill::resolve_session;
@@ -18,16 +18,14 @@ pub struct AttachContext<'a, S: SshHost> {
     pub ssh: S,
     /// UUID or shortname of the session to attach.
     pub selector: String,
-    /// Whether a TTY is attached (allows interactive TOFU prompts).
-    pub is_interactive: bool,
 }
 
 /// Everything SSH needs to open the session; returned by `prepare_attach`.
-#[derive(Debug)]
 ///
 /// The caller execs `argv[0]` with `argv[1..]`. The `_tmpdir` must be kept alive
 /// until after exec (the known_hosts file must exist on disk). In production,
-/// `std::mem::forget(_tmpdir)` before exec so the file persists until process exit.
+/// call `std::mem::forget(_tmpdir)` before exec so the file persists until process exit.
+#[derive(Debug)]
 pub struct SshInvocation {
     pub argv: Vec<String>,
     /// Owns the temp directory containing the known_hosts file.
@@ -45,6 +43,14 @@ pub struct SshInvocation {
 /// 6. Return SSH argv.
 ///
 /// The caller is responsible for exec'ing the returned `argv`.
+///
+/// # Security model
+///
+/// mux stores only the fingerprint hash (not the raw SSH public-key blob), so
+/// the temp known_hosts file is written empty — OpenSSH cannot verify the key
+/// against it directly. The fingerprint is verified before exec via TOFU (step 4).
+/// `HostKeyAlgorithms` is pinned to the verified algorithm to prevent key-type
+/// downgrade. `StrictHostKeyChecking=accept-new` prevents polluting `~/.ssh/known_hosts`.
 pub fn prepare_attach<S: SshHost>(ctx: AttachContext<'_, S>) -> Result<SshInvocation> {
     // Step 1 — resolve selector
     let session = resolve_session(ctx.conn, &ctx.selector)?;
@@ -68,45 +74,29 @@ pub fn prepare_attach<S: SshHost>(ctx: AttachContext<'_, S>) -> Result<SshInvoca
     let tofu = check_host_key(ctx.conn, host.id, &key_info.algorithm, &key_info.fingerprint)?;
     match tofu {
         TrustCheckResult::Trusted => {}
-        TrustCheckResult::Mismatch {
-            algorithm,
-            stored,
-            received,
-        } => {
+        TrustCheckResult::Mismatch { algorithm: _, stored, received } => {
             bail!(
-                "mux: host key mismatch for '{}': stored {}:{}, received {}:{}",
-                host.alias,
-                algorithm,
-                stored,
-                algorithm,
-                received
+                "mux: host key mismatch for '{}': stored {}, received {}",
+                host.alias, stored, received,
             );
         }
         TrustCheckResult::FirstContact { algorithm, fingerprint } => {
-            // Attach never silently trusts on first contact — it refuses with a hint.
+            // Attach never trusts on first contact — it refuses with an actionable hint.
             bail!(
                 "mux: unknown host key ({}:{}) for '{}'; run 'mux host test {}' to trust it",
-                algorithm,
-                fingerprint,
-                host.alias,
-                host.alias
+                algorithm, fingerprint, host.alias, host.alias
             );
         }
     }
 
-    // Step 5 — select algorithm for HostKeyAlgorithms pin
-    let fingerprints = fingerprint_repo::list_for_host(ctx.conn, host.id)?;
-    let preferred = mux_ssh::trust::preferred_fingerprint_for_attach(&fingerprints)
-        .ok_or_else(|| anyhow::anyhow!("mux: no trusted host key stored for '{}'", host.alias))?;
-    let host_key_algorithms = build_host_key_algorithms(&preferred.algorithm);
-
-    // Step 6 — write temp known_hosts file
+    // Step 5 — build HostKeyAlgorithms from the verified algorithm
     //
-    // We only store the fingerprint hash (not the raw public key blob), so we write
-    // an empty known_hosts file. SSH will not verify the key against known_hosts;
-    // instead, fingerprint verification was done above via TOFU. The algorithm is
-    // pinned via HostKeyAlgorithms to prevent downgrade. StrictHostKeyChecking=accept-new
-    // prevents SSH from writing to ~/.ssh/known_hosts while still completing the connection.
+    // Pin to key_info.algorithm (the algorithm TOFU just validated), not a separately
+    // loaded "preferred" algorithm. Using a different algorithm here would pin an
+    // algorithm whose key was never verified in this run.
+    let host_key_algorithms = build_host_key_algorithms(&key_info.algorithm);
+
+    // Step 6 — write temp known_hosts file (see §Security model above)
     let tmpdir = tempfile::Builder::new()
         .prefix("mux-attach-")
         .tempdir()?;
@@ -114,10 +104,12 @@ pub fn prepare_attach<S: SshHost>(ctx: AttachContext<'_, S>) -> Result<SshInvoca
     std::fs::write(&known_hosts_path, "")?;
 
     // Step 7 — build SSH argv
+    let port = u16::try_from(host.port)
+        .map_err(|_| anyhow::anyhow!("mux: invalid port {} for host '{}'", host.port, host.alias))?;
     let argv = build_ssh_argv(
         &host.user,
         &host.addr,
-        host.port as u16,
+        port,
         known_hosts_path.to_string_lossy().as_ref(),
         &host_key_algorithms,
         &tmux_name,
@@ -126,16 +118,26 @@ pub fn prepare_attach<S: SshHost>(ctx: AttachContext<'_, S>) -> Result<SshInvoca
     Ok(SshInvocation { argv, _tmpdir: tmpdir })
 }
 
-/// Build the HostKeyAlgorithms value for the given stored algorithm.
+/// Build the HostKeyAlgorithms value for the given algorithm.
 ///
 /// RSA: SHA-512 before SHA-256 per docs/04 §Host key algorithms.
-/// For any unknown algorithm, use it verbatim.
+/// For unknown algorithms, use verbatim.
 pub(crate) fn build_host_key_algorithms(algorithm: &str) -> String {
     match algorithm {
         "ssh-ed25519" => "ssh-ed25519".to_owned(),
         "ecdsa-sha2-nistp256" => "ecdsa-sha2-nistp256".to_owned(),
         "rsa-sha2-512" | "rsa-sha2-256" => "rsa-sha2-512,rsa-sha2-256".to_owned(),
         other => other.to_owned(),
+    }
+}
+
+/// Format an SSH host:port target, bracketing IPv6 addresses.
+fn format_ssh_target(user: &str, addr: &str) -> String {
+    if addr.contains(':') {
+        // IPv6 literal: SSH requires brackets, e.g. user@[::1]
+        format!("{user}@[{addr}]")
+    } else {
+        format!("{user}@{addr}")
     }
 }
 
@@ -156,7 +158,7 @@ fn build_ssh_argv(
         "-o".to_owned(),
         "StrictHostKeyChecking=accept-new".to_owned(),
         "-t".to_owned(),
-        format!("{user}@{addr}"),
+        format_ssh_target(user, addr),
         "-p".to_owned(),
         port.to_string(),
         "tmux".to_owned(),
@@ -170,9 +172,6 @@ fn build_ssh_argv(
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
-    use std::collections::VecDeque;
-
     use super::*;
     use mux_state::session_repo::{activate, ReserveParams};
     use mux_state::{host_repo, session_repo};
@@ -180,19 +179,16 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::create::{HostKeyInfo, SshHost};
-    use crate::agent_start::RemoteExec;
 
     // ── MockSshHost ───────────────────────────────────────────────────────────
 
     struct MockSshHost {
-        responses: RefCell<VecDeque<(i32, String, String)>>,
         host_key_result: Result<HostKeyInfo, mux_core::error::MuxError>,
     }
 
     impl MockSshHost {
         fn with_key(fingerprint: &str) -> Self {
             MockSshHost {
-                responses: RefCell::new(VecDeque::new()),
                 host_key_result: Ok(HostKeyInfo {
                     algorithm: "ssh-ed25519".to_owned(),
                     fingerprint: fingerprint.to_owned(),
@@ -202,22 +198,17 @@ mod tests {
 
         fn with_key_alg(algorithm: &str, fingerprint: &str) -> Self {
             MockSshHost {
-                responses: RefCell::new(VecDeque::new()),
                 host_key_result: Ok(HostKeyInfo {
                     algorithm: algorithm.to_owned(),
                     fingerprint: fingerprint.to_owned(),
                 }),
             }
         }
-
     }
 
-    impl RemoteExec for MockSshHost {
+    impl crate::agent_start::RemoteExec for MockSshHost {
         fn run(&self, _cmd: &str) -> Result<(i32, String, String), mux_core::error::MuxError> {
-            self.responses
-                .borrow_mut()
-                .pop_front()
-                .ok_or_else(|| mux_core::error::MuxError::Other(anyhow::anyhow!("no mock responses")))
+            Err(mux_core::error::MuxError::Other(anyhow::anyhow!("attach does not call run()")))
         }
     }
 
@@ -278,8 +269,24 @@ mod tests {
             conn,
             ssh,
             selector: selector.to_owned(),
-            is_interactive: false,
         }
+    }
+
+    // ── format_ssh_target ─────────────────────────────────────────────────────
+
+    #[test]
+    fn ssh_target_ipv4_no_brackets() {
+        assert_eq!(format_ssh_target("user", "192.0.2.1"), "user@192.0.2.1");
+    }
+
+    #[test]
+    fn ssh_target_ipv6_gets_brackets() {
+        assert_eq!(format_ssh_target("user", "2001:db8::1"), "user@[2001:db8::1]");
+    }
+
+    #[test]
+    fn ssh_target_ipv6_loopback_gets_brackets() {
+        assert_eq!(format_ssh_target("user", "::1"), "user@[::1]");
     }
 
     // ── build_host_key_algorithms ─────────────────────────────────────────────
@@ -296,14 +303,12 @@ mod tests {
 
     #[test]
     fn alg_rsa_512_returns_both_sha2_ordered() {
-        let v = build_host_key_algorithms("rsa-sha2-512");
-        assert_eq!(v, "rsa-sha2-512,rsa-sha2-256");
+        assert_eq!(build_host_key_algorithms("rsa-sha2-512"), "rsa-sha2-512,rsa-sha2-256");
     }
 
     #[test]
     fn alg_rsa_256_returns_both_sha2_ordered() {
-        let v = build_host_key_algorithms("rsa-sha2-256");
-        assert_eq!(v, "rsa-sha2-512,rsa-sha2-256");
+        assert_eq!(build_host_key_algorithms("rsa-sha2-256"), "rsa-sha2-512,rsa-sha2-256");
     }
 
     #[test]
@@ -341,7 +346,6 @@ mod tests {
 
         let inv = prepare_attach(make_ctx(conn, MockSshHost::with_key("FP"), uuid)).unwrap();
         assert!(inv.argv.contains(&"user@192.0.2.1".to_owned()));
-        assert!(inv.argv.iter().any(|a| a == "-p"));
         let port_idx = inv.argv.iter().position(|a| a == "-p").unwrap();
         assert_eq!(inv.argv[port_idx + 1], "22");
     }
@@ -356,9 +360,7 @@ mod tests {
         trust(conn, host_id);
 
         let inv = prepare_attach(make_ctx(conn, MockSshHost::with_key("FP"), uuid)).unwrap();
-        let kh_arg = inv.argv.iter()
-            .find(|a| a.starts_with("UserKnownHostsFile="))
-            .unwrap();
+        let kh_arg = inv.argv.iter().find(|a| a.starts_with("UserKnownHostsFile=")).unwrap();
         let path = kh_arg.strip_prefix("UserKnownHostsFile=").unwrap();
         assert!(std::path::Path::new(path).exists());
     }
@@ -377,6 +379,29 @@ mod tests {
         assert!(inv.argv.iter().any(|a| a == "HostKeyAlgorithms=rsa-sha2-512,rsa-sha2-256"));
     }
 
+    /// Regression: with multiple stored fingerprints, the pin must use the algorithm
+    /// TOFU verified (key_info.algorithm), not the stored "preferred" one.
+    #[test]
+    fn prepare_attach_pins_verified_algorithm_not_preferred() {
+        let (_dir, store) = open_store();
+        let conn = store.conn();
+        let host_id = insert_host(conn);
+        let uuid = "abababab-abab-abab-abab-abababababab";
+        insert_active_session(conn, host_id, uuid, "multialgapp");
+        // Store both ed25519 (preferred) and ecdsa
+        mux_ssh::trust::trust_fingerprint(conn, host_id, "ssh-ed25519", "EDFP").unwrap();
+        mux_ssh::trust::trust_fingerprint(conn, host_id, "ecdsa-sha2-nistp256", "ECDSAFP").unwrap();
+
+        // SSH presents ecdsa — TOFU validates ecdsa, pin must be ecdsa (not ed25519)
+        let ssh = MockSshHost::with_key_alg("ecdsa-sha2-nistp256", "ECDSAFP");
+        let inv = prepare_attach(make_ctx(conn, ssh, uuid)).unwrap();
+        assert!(
+            inv.argv.iter().any(|a| a == "HostKeyAlgorithms=ecdsa-sha2-nistp256"),
+            "pin should be ecdsa (verified), not ed25519 (preferred); argv: {:?}",
+            inv.argv
+        );
+    }
+
     // ── prepare_attach — error paths ─────────────────────────────────────────
 
     #[test]
@@ -392,6 +417,31 @@ mod tests {
 
         let err = prepare_attach(make_ctx(conn, MockSshHost::with_key("FP"), uuid)).unwrap_err();
         assert!(err.to_string().contains("dead"), "got: {err}");
+    }
+
+    #[test]
+    fn prepare_attach_session_no_tmux_name_errors() {
+        let (_dir, store) = open_store();
+        let conn = store.conn();
+        let host_id = insert_host(conn);
+        let uuid = "33333333-3333-3333-3333-333333333333";
+        // Reserve but don't activate — tmux_name stays None
+        session_repo::reserve(
+            conn,
+            &ReserveParams {
+                uuid,
+                host_id,
+                shortname: "nametestapp",
+                repo_slug: "owner/repo",
+                branch: "main",
+                created_at: 1_000_000,
+            },
+        )
+        .unwrap();
+        trust(conn, host_id);
+
+        let err = prepare_attach(make_ctx(conn, MockSshHost::with_key("FP"), uuid)).unwrap_err();
+        assert!(err.to_string().contains("no tmux name"), "got: {err}");
     }
 
     #[test]
@@ -415,7 +465,6 @@ mod tests {
         let host_id = insert_host(conn);
         let uuid = "11111111-1111-1111-1111-111111111111";
         insert_active_session(conn, host_id, uuid, "newapp");
-        // No fingerprint stored — first contact
 
         let ssh = MockSshHost::with_key("UNKNOWN_FP");
         let err = prepare_attach(make_ctx(conn, ssh, uuid)).unwrap_err();
