@@ -2,6 +2,31 @@
 
 tmux + persistence — clean-room Rust reimplementation.
 
+## Quick Start
+
+`mux` lets you create persistent tmux sessions on remote hosts over SSH, then attach and detach from them as if you never left.
+
+**Prerequisites:** `ssh-agent` running with your key loaded, tmux ≥ 3.0 on each remote host.
+
+```sh
+# One-time setup
+mux init
+mux host add myserver alice@192.168.1.10
+mux host test myserver          # connects, probes, and stores the host key (TOFU)
+mux agent deploy myserver       # uploads the mux-agent binary
+
+# Create a session from a GitHub repo
+mux create alice/myproject --host myserver
+
+# List and attach
+mux list
+mux attach myproject
+```
+
+For the full command reference, TOFU details, troubleshooting, and environment variables, see the **[User Guide](docs/guide.md)**.
+
+---
+
 ## Workspace layout
 
 ```
