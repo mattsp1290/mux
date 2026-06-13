@@ -12,7 +12,11 @@ pub async fn run_host(action: HostAction, conn: &Connection) -> Result<()> {
         HostAction::Add { alias, user_at_addr, port } => cmd_add(conn, alias, user_at_addr, port),
         HostAction::List => cmd_list(conn),
         HostAction::Remove { alias, yes } => cmd_remove(conn, alias, yes).await,
+        // TODO: wire to cmd_test_core once a real SshHost SSH impl lands (host
+        // lookup via get_by_alias, build executor, derive is_interactive from
+        // std::io::IsTerminal).
         HostAction::Test { alias } => bail!("SSH not yet implemented (host test for '{alias}')"),
+        // TODO: wire to cmd_trust_core once a real SshHost SSH impl lands.
         HostAction::Trust { alias } => bail!("SSH not yet implemented (host trust for '{alias}')"),
     }
 }
@@ -311,14 +315,23 @@ pub fn cmd_test_core<S: crate::create::SshHost>(
     let home = preflight.home;
 
     // Step 5: Probe transport.
+    // exit 0 → socket exists → streamlocal; exit 1 → no socket → tcp;
+    // any other exit code → command failed (permission denied, not a shell, etc.) → error.
     let sock_path = format!("{}/.mux/agent.sock", home);
     let transport = {
-        let (code, _, _) = ssh.run(&format!("test -S {}", sh_quote(&sock_path)))
+        let (code, _, stderr) = ssh.run(&format!("test -S {}", sh_quote(&sock_path)))
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        if code == 0 { "streamlocal" } else { "tcp" }
+        match code {
+            0 => "streamlocal",
+            1 => "tcp",
+            _ => bail!("transport probe failed (exit {}): {}", code, stderr.trim()),
+        }
     };
 
     // Step 6: Persist via host_repo::update_probe.
+    // TODO: also persist tmux_version (spec §host-test: "Persists: …tmux_version, tool
+    // availability"). Requires adding a tmux_version column to the hosts table and
+    // extending host_repo::update_probe — deferred to a schema migration iteration.
     mux_state::host_repo::update_probe(conn, host.id, Some(&arch), Some(&home), Some(transport))?;
 
     // Step 7: Print confirmation.
@@ -651,105 +664,88 @@ mod tests {
 
     // ── new: cmd_test_core ────────────────────────────────────────────────────
 
-    /// Test that cmd_test_core works when key is trusted and preflight succeeds.
-    ///
-    /// Because `list_agent_keys()` is not mockable in unit tests (it connects to
-    /// the real SSH agent socket), this test exercises all the sub-functions that
-    /// `cmd_test_core` composes rather than calling it end-to-end.
+    /// Preflight parse + arch normalize + update_probe integration.
     #[test]
-    fn cmd_test_tofu_trusted_persists() {
+    fn cmd_test_components_happy_path() {
         let (_dir, store) = open_store();
         let conn = store.conn();
         let host = insert_host(conn, "prod");
-        trust_key(conn, host.id);
 
-        // 1. TOFU check: stored key matches → Trusted.
+        // TOFU check: stored key matches → Trusted.
+        trust_key(conn, host.id);
         let trust_result = mux_ssh::trust::check_host_key(
             conn, host.id, "ssh-ed25519", "SHA256:AAAA",
         ).unwrap();
         assert_eq!(trust_result, mux_ssh::trust::TrustCheckResult::Trusted);
 
-        // 2. Preflight parse (MOTD noise before sentinel is discarded).
-        let sentinel_output = "MUX_SENTINEL_V1\nx86_64\n/home/user\ntmux 3.3a\nMUX_SENTINEL_V1_END\n";
-        let preflight = parse_preflight_output(sentinel_output).unwrap();
+        // Preflight parse with MOTD noise.
+        let output = "Welcome!\nMUX_SENTINEL_V1\nx86_64\n/home/user\ntmux 3.3a\nMUX_SENTINEL_V1_END\n";
+        let preflight = parse_preflight_output(output).unwrap();
         assert_eq!(preflight.arch, "amd64");
         assert_eq!(preflight.home, "/home/user");
         assert_eq!(preflight.tmux_version, "3.3a");
 
-        // 3. Transport probe: mock returns exit 1 (no socket → tcp).
-        let ssh_transport = MockSshHost::with_trusted_key(vec![(1, "", "")]);
-        let (code, _, _) = ssh_transport.run("test -S '/home/user/.mux/agent.sock'").unwrap();
-        let transport = if code == 0 { "streamlocal" } else { "tcp" };
-        assert_eq!(transport, "tcp");
-
-        // 4. Persist via update_probe and verify the row.
-        mux_state::host_repo::update_probe(conn, host.id, Some("amd64"), Some("/home/user"), Some("tcp")).unwrap();
+        // Persist and verify.
+        mux_state::host_repo::update_probe(
+            conn, host.id, Some("amd64"), Some("/home/user"), Some("tcp"),
+        ).unwrap();
         let updated = mux_state::host_repo::get_by_id(conn, host.id).unwrap().unwrap();
         assert_eq!(updated.arch.as_deref(), Some("amd64"));
         assert_eq!(updated.home.as_deref(), Some("/home/user"));
         assert_eq!(updated.transport.as_deref(), Some("tcp"));
     }
 
-    /// First contact when non-interactive should error.
+    // ── cmd_trust_core tests ───────────────────────────────────────────────────
+
+    /// No stored fingerprint → instruct user to run host test first.
     #[test]
-    fn cmd_test_tofu_first_contact_non_interactive_errors() {
+    fn cmd_trust_no_stored_fingerprint_prints_message() {
         let (_dir, store) = open_store();
         let conn = store.conn();
         let host = insert_host(conn, "newhost");
-        // No stored fingerprint → FirstContact
-
-        // We can't easily skip list_agent_keys in a unit test, so test the TOFU
-        // logic directly via check_host_key.
-        let result = mux_ssh::trust::check_host_key(
-            conn,
-            host.id,
-            "ssh-ed25519",
-            "SHA256:AAAA",
-        ).unwrap();
-
-        // FirstContact + non-interactive should be caught
-        match result {
-            mux_ssh::trust::TrustCheckResult::FirstContact { .. } => {
-                // This is the correct path — in cmd_test_core, is_interactive=false
-                // would bail! here.
-                let is_interactive = false;
-                if !is_interactive {
-                    // simulate the bail
-                    let _ = anyhow::anyhow!("non-interactive first contact");
-                    return; // test passes
-                }
-                panic!("should have errored for non-interactive first contact");
-            }
-            other => panic!("expected FirstContact, got: {:?}", other),
-        }
+        let ssh = MockSshHost::with_trusted_key(vec![]);
+        // Should succeed (not error) and print a message.
+        cmd_trust_core(conn, &host, &ssh).unwrap();
     }
 
-    /// Mismatch should always error regardless of interactive flag.
+    /// Trusted key → unchanged message, no prompt.
     #[test]
-    fn cmd_test_tofu_mismatch_errors() {
+    fn cmd_trust_trusted_key_unchanged() {
+        let (_dir, store) = open_store();
+        let conn = store.conn();
+        let host = insert_host(conn, "trustedhost");
+        trust_key(conn, host.id);
+        // MockSshHost returns SHA256:AAAA → matches stored → Trusted.
+        let ssh = MockSshHost::with_trusted_key(vec![]);
+        cmd_trust_core(conn, &host, &ssh).unwrap();
+        // Fingerprint should still be SHA256:AAAA (unchanged).
+        let fp = mux_state::fingerprint_repo::get(conn, host.id, "ssh-ed25519")
+            .unwrap().unwrap();
+        assert_eq!(fp.fingerprint, "SHA256:AAAA");
+    }
+
+    /// Mismatch with no stdin → read_yes_no reads empty line → rotation declined.
+    #[test]
+    fn cmd_trust_mismatch_declined() {
         let (_dir, store) = open_store();
         let conn = store.conn();
         let host = insert_host(conn, "mismatchhost");
-        // Store a different fingerprint
+        // Store a DIFFERENT fingerprint so MockSshHost's SHA256:AAAA causes Mismatch.
         mux_state::fingerprint_repo::upsert(
             conn, host.id, "ssh-ed25519", "SHA256:DIFFERENT", 1_000_000,
         ).unwrap();
-
-        // check_host_key with a different received value should return Mismatch
-        let result = mux_ssh::trust::check_host_key(
-            conn,
-            host.id,
-            "ssh-ed25519",
-            "SHA256:AAAA",
-        ).unwrap();
-
-        match result {
-            mux_ssh::trust::TrustCheckResult::Mismatch { algorithm, stored, received } => {
-                assert_eq!(algorithm, "ssh-ed25519");
-                assert_eq!(stored, "SHA256:DIFFERENT");
-                assert_eq!(received, "SHA256:AAAA");
-            }
-            other => panic!("expected Mismatch, got: {:?}", other),
-        }
+        // MockSshHost returns SHA256:AAAA → Mismatch.
+        let ssh = MockSshHost::with_trusted_key(vec![]);
+        // read_yes_no will read from stdin — in a non-interactive test stdin is empty,
+        // so read_line returns "" → trimmed == "" → accepted = false → bail.
+        let err = cmd_trust_core(conn, &host, &ssh).unwrap_err();
+        assert!(
+            err.to_string().contains("declined") || err.to_string().contains("rotation"),
+            "expected decline error, got: {err}"
+        );
+        // Fingerprint should remain SHA256:DIFFERENT (not rotated).
+        let fp = mux_state::fingerprint_repo::get(conn, host.id, "ssh-ed25519")
+            .unwrap().unwrap();
+        assert_eq!(fp.fingerprint, "SHA256:DIFFERENT", "fingerprint should not be updated on decline");
     }
 }
