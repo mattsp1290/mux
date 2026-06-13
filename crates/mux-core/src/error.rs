@@ -140,6 +140,11 @@ pub enum MuxError {
     #[error("agent error: {0}")]
     AgentError(String),
 
+    /// Agent did not become ready within the startup timeout.
+    /// Hint: "Check agent.log on the remote host for details."
+    #[error("agent start timed out; last log:\n{log_tail}")]
+    AgentStartTimeout { log_tail: String },
+
     /// RPC transport or protocol failure.
     #[error("RPC error: {0}")]
     RpcError(String),
@@ -178,6 +183,9 @@ impl MuxError {
             MuxError::InvalidForceTransport(_) => {
                 Some("Valid values are 'streamlocal' and 'tcp'.")
             }
+            MuxError::AgentStartTimeout { .. } => {
+                Some("Check agent.log on the remote host.")
+            }
             _ => None,
         }
     }
@@ -197,6 +205,7 @@ impl MuxError {
             MuxError::SessionAlreadyExists { .. } => "session_already_exists",
             MuxError::ShortnameExhausted => "shortname_exhausted",
             MuxError::RpcError(_) | MuxError::AgentError(_) => "rpc_error",
+            MuxError::AgentStartTimeout { .. } => "agent_start_timeout",
             MuxError::InvalidForceTransport(_) => "invalid_force_transport",
             MuxError::Other(_) => "other",
             // Remaining variants: user-input or host errors without a dedicated spec category.
@@ -228,6 +237,7 @@ impl MuxError {
             | MuxError::TofuNonInteractive
             | MuxError::HostKeyRejected
             | MuxError::AgentError(_)
+            | MuxError::AgentStartTimeout { .. }
             | MuxError::RpcError(_)
             | MuxError::InvalidForceTransport(_) => 1,
             MuxError::Other(_) => 2,

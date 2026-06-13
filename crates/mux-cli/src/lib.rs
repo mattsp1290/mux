@@ -4,6 +4,7 @@ use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::generate;
 
+pub mod agent_start;
 pub mod host;
 pub mod mux_home;
 
