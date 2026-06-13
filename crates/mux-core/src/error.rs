@@ -14,6 +14,10 @@ pub enum MuxError {
     #[error("invalid endpoint: {0}")]
     InvalidEndpoint(String),
 
+    /// Raised when parsing repository input strings (owner/repo or git@host:path.git).
+    #[error("invalid repo: {0}")]
+    InvalidRepo(String),
+
     /// Raised when loading session status from SQLite — implemented in mux-7sa.
     #[error("invalid session status: {0}")]
     InvalidSessionStatus(String),
