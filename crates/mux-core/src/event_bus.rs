@@ -26,6 +26,11 @@ pub struct RpcRequestEvent {
 }
 
 /// Fired when the `mux create` transaction completes (success or failure).
+///
+/// **Forward-reserved.** `CreateFlowEvent` is defined here so future consumers
+/// (e.g. mux-kfo) can subscribe to it via this bus. The CLI emits `create_flow`
+/// via `tracing::info!` only — it runs in a separate process and has no access
+/// to the agent's in-process bus.
 #[derive(Debug, Clone)]
 pub struct CreateFlowEvent {
     /// Total wall-clock duration of the create flow, in milliseconds.
@@ -44,6 +49,10 @@ pub enum BusEvent {
     /// An RPC request completed.
     RpcRequest(RpcRequestEvent),
     /// A `mux create` flow completed (success or failure).
+    ///
+    /// **Not yet published.** Reserved for a future consumer with in-process
+    /// access to the create flow. Currently the CLI emits a `tracing::info!`
+    /// event instead (it runs as a separate process).
     CreateFlow(CreateFlowEvent),
     /// The mux-agent started and is ready to accept connections.
     AgentStarted {

@@ -91,7 +91,7 @@ pub struct CreateResult {
 pub async fn run_create<S: SshHost>(ctx: CreateContext<'_, S>) -> Result<CreateResult, MuxError> {
     let now = unix_now();
     let flow_start = std::time::Instant::now();
-    // Set after the clone command completes; remains None if an earlier step fails.
+    // Set after the clone command completes; only read on paths after step 7.
     let git_clone_duration_ms;
 
     // ── Preconditions ─────────────────────────────────────────────────────────
@@ -343,6 +343,13 @@ pub async fn run_create<S: SshHost>(ctx: CreateContext<'_, S>) -> Result<CreateR
         Err(e) => {
             cancel_reservation(ctx.conn, &uuid);
             let _ = ctx.ssh.run(&format!("rm -rf {}", sh_quote(&workdir_parent_str)));
+            tracing::info!(
+                create_duration_ms = flow_start.elapsed().as_millis() as u64,
+                git_clone_duration_ms,
+                host = ctx.host.alias.as_str(),
+                error_category = "agent_start_failed",
+                "create_flow"
+            );
             return Err(e);
         }
     };
@@ -368,6 +375,13 @@ pub async fn run_create<S: SshHost>(ctx: CreateContext<'_, S>) -> Result<CreateR
         Err(e) => {
             cancel_reservation(ctx.conn, &uuid);
             let _ = ctx.ssh.run(&format!("rm -rf {}", sh_quote(&workdir_parent_str)));
+            tracing::info!(
+                create_duration_ms = flow_start.elapsed().as_millis() as u64,
+                git_clone_duration_ms,
+                host = ctx.host.alias.as_str(),
+                error_category = "rpc_create_session_failed",
+                "create_flow"
+            );
             return Err(e);
         }
     };
@@ -383,7 +397,16 @@ pub async fn run_create<S: SshHost>(ctx: CreateContext<'_, S>) -> Result<CreateR
         transport_str,
         unix_now(),
     )
-    .map_err(MuxError::Other)?;
+    .map_err(|e| {
+        tracing::info!(
+            create_duration_ms = flow_start.elapsed().as_millis() as u64,
+            git_clone_duration_ms,
+            host = ctx.host.alias.as_str(),
+            error_category = "activate_failed",
+            "create_flow"
+        );
+        MuxError::Other(e)
+    })?;
 
     // ── Done ──────────────────────────────────────────────────────────────────
 
