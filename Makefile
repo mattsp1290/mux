@@ -6,11 +6,12 @@ fmt:
 
 # Check formatting without modifying files (CI gate)
 fmt-check:
-	cargo fmt --check
+	cargo fmt --all --check
 
-# Lint: warnings are errors
+# Lint: warnings are errors; --workspace is explicit so adding a root [package]
+# to Cargo.toml later doesn't silently narrow coverage
 lint:
-	cargo clippy --all-targets -- -D warnings
+	cargo clippy --workspace --all-targets -- -D warnings
 
 # Unit tests only
 test-unit:
@@ -19,7 +20,6 @@ test-unit:
 # Integration tests (placeholder until mux-3bv scaffolds the test environment)
 test-integration:
 	@echo "Integration test environment not yet configured — see mux-3bv"
-	@exit 0
 
 # All tests (unit + integration)
 test: test-unit test-integration

@@ -31,10 +31,10 @@ Individual commands:
 
 ```sh
 # Format check (no-op on CI; run `cargo fmt --all` to fix locally)
-cargo fmt --check
+cargo fmt --all --check
 
-# Lint (warnings are errors; --all-targets includes tests and examples)
-cargo clippy --all-targets -- -D warnings
+# Lint (warnings are errors; --workspace + --all-targets covers every crate)
+cargo clippy --workspace --all-targets -- -D warnings
 
 # Unit tests
 cargo test --workspace
