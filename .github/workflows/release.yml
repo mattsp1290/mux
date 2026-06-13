@@ -1,0 +1,135 @@
+name: Release
+
+# Builds mux CLI and mux-agent cross-compiled binaries on version tags.
+# Artifacts are uploaded to GitHub Releases.
+#
+# mux-agent targets:
+#   x86_64-unknown-linux-musl  → dist/mux-agent-amd64
+#   aarch64-unknown-linux-musl → dist/mux-agent-arm64
+#
+# See prompts/docs/release.md for full release notes and decisions.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-mux-agent:
+    name: Build mux-agent (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            artifact_name: mux-agent-amd64
+          - target: aarch64-unknown-linux-musl
+            artifact_name: mux-agent-arm64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        # TODO: pin dtolnay/rust-toolchain to a commit SHA for supply-chain safety
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cross
+        run: cargo install cross --version 0.2.5
+
+      - name: Build mux-agent (cross)
+        run: |
+          cross build --release --target ${{ matrix.target }} -p mux-agent
+
+      - name: Stage artifact
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/mux-agent dist/${{ matrix.artifact_name }}
+          chmod +x dist/${{ matrix.artifact_name }}
+
+      - name: Verify artifact (non-zero size, executable)
+        run: |
+          test -x dist/${{ matrix.artifact_name }} || (echo "artifact not executable" && exit 1)
+          size=$(stat -c%s dist/${{ matrix.artifact_name }})
+          test "$size" -gt 0 || (echo "artifact is zero bytes" && exit 1)
+          echo "artifact ok: $size bytes"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/${{ matrix.artifact_name }}
+
+  build-mux-cli:
+    name: Build mux CLI (Linux amd64)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        # TODO: pin dtolnay/rust-toolchain to a commit SHA for supply-chain safety
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build mux CLI
+        run: cargo build --release -p mux
+
+      - name: Stage artifact
+        run: |
+          mkdir -p dist
+          cp target/release/mux dist/mux
+          chmod +x dist/mux
+
+      - name: Verify artifact (non-zero size, executable)
+        run: |
+          test -x dist/mux || (echo "artifact not executable" && exit 1)
+          size=$(stat -c%s dist/mux)
+          test "$size" -gt 0 || (echo "artifact is zero bytes" && exit 1)
+          echo "artifact ok: $size bytes"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mux-linux-amd64
+          path: dist/mux
+
+  release:
+    name: Create GitHub Release
+    needs: [build-mux-agent, build-mux-cli]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Flatten dist directory
+        run: |
+          # download-artifact v4 puts each artifact in a subdirectory; flatten.
+          find dist -mindepth 2 -maxdepth 2 -type f -exec mv {} dist/ \;
+
+      - name: Create release
+        # TODO: pin softprops/action-gh-release to a commit SHA for supply-chain safety
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/mux
+            dist/mux-agent-amd64
+            dist/mux-agent-arm64
+          generate_release_notes: true
+          fail_on_unmatched_files: true

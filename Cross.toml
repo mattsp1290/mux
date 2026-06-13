@@ -1,0 +1,15 @@
+# Cross.toml — configuration for cross-rs (https://github.com/cross-rs/cross)
+#
+# Used to build mux-agent as a statically linked musl binary for Linux
+# amd64 and arm64 remote hosts.
+#
+# Build commands (run from repo root):
+#   cross build --release --target x86_64-unknown-linux-musl -p mux-agent
+#   cross build --release --target aarch64-unknown-linux-musl -p mux-agent
+#
+# Output staged to dist/ by the release workflow:
+#   dist/mux-agent-amd64  (x86_64-unknown-linux-musl)
+#   dist/mux-agent-arm64  (aarch64-unknown-linux-musl)
+#
+# No custom Docker images required — cross default images handle both targets.
+# Add [[target.*]] sections here if custom images or volume mounts are needed.
