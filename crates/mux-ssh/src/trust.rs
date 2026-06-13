@@ -8,6 +8,13 @@ use std::os::unix::net::UnixStream;
 use anyhow::Result;
 use mux_state::fingerprint_repo;
 
+// ── Wire protocol constants ───────────────────────────────────────────────────
+
+const SSH2_AGENTC_REQUEST_IDENTITIES: u8 = 0x0b;
+const SSH2_AGENT_IDENTITIES_ANSWER: u8 = 0x0c;
+const SSH_AGENT_FAILURE: u8 = 0x05;
+const MAX_AGENT_REPLY: usize = 256 * 1024;
+
 // ── Algorithm preference order for attach pinning ────────────────────────────
 
 const ALG_PREFERENCE: &[&str] = &[
@@ -70,7 +77,7 @@ pub fn trust_fingerprint(
 ) -> Result<()> {
     let trusted_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .expect("system time before epoch")
+        .unwrap_or_default()
         .as_secs() as i64;
     fingerprint_repo::upsert(conn, host_id, algorithm, fingerprint, trusted_at)
 }
@@ -78,9 +85,9 @@ pub fn trust_fingerprint(
 /// Select the best stored fingerprint for `mux attach` (algorithm preference order).
 ///
 /// Returns `None` if the host has no stored fingerprints.
-pub fn preferred_fingerprint_for_attach<'a>(
-    fingerprints: &'a [mux_state::model::KnownHostFingerprint],
-) -> Option<&'a mux_state::model::KnownHostFingerprint> {
+pub fn preferred_fingerprint_for_attach(
+    fingerprints: &[mux_state::model::KnownHostFingerprint],
+) -> Option<&mux_state::model::KnownHostFingerprint> {
     if fingerprints.is_empty() {
         return None;
     }
@@ -106,10 +113,15 @@ pub fn list_agent_keys() -> Result<Vec<AgentKey>, mux_core::error::MuxError> {
     let mut stream =
         UnixStream::connect(&sock_path).map_err(|_| mux_core::error::MuxError::SshAgentNotForwarded)?;
 
-    // Send SSH2_AGENTC_REQUEST_IDENTITIES (0x0b), length-prefixed.
+    // 5-second deadline prevents an unresponsive agent from hanging the CLI.
+    let timeout = std::time::Duration::from_secs(5);
+    let _ = stream.set_read_timeout(Some(timeout));
+    let _ = stream.set_write_timeout(Some(timeout));
+
+    // Send SSH2_AGENTC_REQUEST_IDENTITIES, length-prefixed.
     let mut req = Vec::with_capacity(5);
     req.extend_from_slice(&1u32.to_be_bytes()); // message length = 1
-    req.push(0x0b); // SSH2_AGENTC_REQUEST_IDENTITIES
+    req.push(SSH2_AGENTC_REQUEST_IDENTITIES);
     stream
         .write_all(&req)
         .map_err(|_e| mux_core::error::MuxError::SshAgentNotForwarded)?;
@@ -121,18 +133,27 @@ pub fn list_agent_keys() -> Result<Vec<AgentKey>, mux_core::error::MuxError> {
         .map_err(|_| mux_core::error::MuxError::SshAgentNotForwarded)?;
     let resp_len = u32::from_be_bytes(len_buf) as usize;
 
+    if resp_len == 0 || resp_len > MAX_AGENT_REPLY {
+        tracing::warn!("ssh agent reply length {resp_len} out of bounds (max {MAX_AGENT_REPLY})");
+        return Err(mux_core::error::MuxError::SshAgentNotForwarded);
+    }
+
     let mut body = vec![0u8; resp_len];
     stream
         .read_exact(&mut body)
         .map_err(|_| mux_core::error::MuxError::SshAgentNotForwarded)?;
 
-    // Parse SSH2_AGENT_IDENTITIES_ANSWER (0x0c).
-    if body.is_empty() || body[0] != 0x0c {
-        tracing::warn!(
-            "unexpected SSH agent response type: {}",
-            body.first().copied().unwrap_or(0)
-        );
-        return Ok(Vec::new());
+    // Parse the response type.
+    match body.first().copied() {
+        Some(t) if t == SSH2_AGENT_IDENTITIES_ANSWER => {}
+        Some(SSH_AGENT_FAILURE) => {
+            tracing::warn!("ssh agent returned SSH_AGENT_FAILURE");
+            return Err(mux_core::error::MuxError::SshAgentNotForwarded);
+        }
+        other => {
+            tracing::warn!("unexpected SSH agent response type: {:?}", other);
+            return Err(mux_core::error::MuxError::SshAgentNotForwarded);
+        }
     }
 
     let mut pos = 1usize;
@@ -141,7 +162,8 @@ pub fn list_agent_keys() -> Result<Vec<AgentKey>, mux_core::error::MuxError> {
         None => return Ok(Vec::new()),
     };
 
-    let mut keys = Vec::with_capacity(count);
+    // Clamp capacity: real agents hold at most a handful of keys.
+    let mut keys = Vec::with_capacity(count.min(64));
     for _ in 0..count {
         let key_blob = match read_bytes(&body, &mut pos) {
             Some(b) => b,
@@ -155,7 +177,11 @@ pub fn list_agent_keys() -> Result<Vec<AgentKey>, mux_core::error::MuxError> {
         // Extract algorithm name from the start of the key blob.
         let algorithm = {
             let mut kb_pos = 0usize;
-            read_string(&key_blob, &mut kb_pos).unwrap_or_default()
+            let alg = read_string(&key_blob, &mut kb_pos).unwrap_or_default();
+            if alg.is_empty() {
+                tracing::warn!("ssh agent key has unreadable algorithm name; key will be skipped by preference selection");
+            }
+            alg
         };
 
         keys.push(AgentKey {
@@ -321,9 +347,8 @@ mod tests {
     // ── list_agent_keys ───────────────────────────────────────────────────────
 
     #[test]
-    fn list_agent_keys_no_sock_var() {
+    fn list_agent_keys_unconnectable_socket() {
         // Point SSH_AUTH_SOCK to a nonexistent path so the connect fails.
-        // This exercises the same error path as a missing var.
         std::env::set_var("SSH_AUTH_SOCK", "/nonexistent/path/agent.sock");
         let result = list_agent_keys();
         assert!(
