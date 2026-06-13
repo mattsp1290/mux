@@ -4,6 +4,7 @@ use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::generate;
 
+pub mod host;
 pub mod mux_home;
 
 /// The full mux CLI definition, exported so `mux-cli` can generate completions.
@@ -52,15 +53,33 @@ pub enum Command {
 #[derive(Debug, Subcommand)]
 pub enum HostAction {
     /// Add a host
-    Add,
-    /// List hosts
+    Add {
+        /// Host alias (alphanumeric, hyphens, underscores; max 64 chars)
+        alias: String,
+        /// Remote user and address as user@addr
+        user_at_addr: String,
+        /// SSH port (1-65535, default 22)
+        #[arg(long, short = 'p', default_value = "22")]
+        port: u16,
+    },
+    /// List configured hosts
     List,
     /// Remove a host
-    Remove,
+    Remove {
+        /// Host alias to remove
+        alias: String,
+        /// Skip confirmation prompt
+        #[arg(long)]
+        yes: bool,
+    },
     /// Test connectivity and trust a host
-    Test,
+    Test {
+        alias: String,
+    },
     /// Rotate or view trust for a host
-    Trust,
+    Trust {
+        alias: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -86,7 +105,11 @@ pub async fn run(command: Command, mux_home: PathBuf) -> Result<()> {
             mux_state::store::Store::open(&db_path)?;
             Ok(())
         }
-        Command::Host { .. } => todo!("mux host"),
+        Command::Host { action } => {
+            let db_path = mux_home.join("mux.db");
+            let store = mux_state::store::Store::open(&db_path)?;
+            crate::host::run_host(action, store.conn()).await
+        }
         Command::Agent { .. } => todo!("mux agent"),
         Command::Create => todo!("mux create"),
         Command::Attach => todo!("mux attach"),
