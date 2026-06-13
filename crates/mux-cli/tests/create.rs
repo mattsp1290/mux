@@ -31,7 +31,7 @@ use mux_core::shortname::{shortname_for_branch, shortname_for_main, shortname_wi
 use mux_rpc::schema::{CreateSessionResponse, RpcError};
 use mux_state::session_repo::{self, ReserveParams};
 use mux_state::store::Store;
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -68,7 +68,6 @@ impl SshHost for MockSshHost {
     fn host_key(&self) -> Result<HostKeyInfo, MuxError> {
         match &self.host_key_result {
             Ok(info) => Ok(info.clone()),
-            Err(MuxError::HostKeyMismatch) => Err(MuxError::HostKeyMismatch),
             Err(_) => Err(MuxError::HostKeyMismatch),
         }
     }
@@ -237,8 +236,9 @@ async fn create_shortname_collision_resolves_with_numeric_suffix() {
     let conn = store.conn();
     let host = insert_configured_host(conn);
 
+    let host_id = host.id;
     let base = shortname_for_branch("myrepo", "feature");
-    occupy_shortname(conn, host.id, "00000000-0000-0000-0000-000000000001", &base);
+    occupy_shortname(conn, host_id, "00000000-0000-0000-0000-000000000001", &base);
 
     let expected_shortname = shortname_with_suffix(&base, 2);
     let rpc_port = spawn_rpc_server(encode_create_ok(&CreateSessionResponse {
@@ -264,6 +264,10 @@ async fn create_shortname_collision_resolves_with_numeric_suffix() {
         result.shortname, expected_shortname,
         "shortname must use -2 suffix when base is taken"
     );
+
+    // Two sessions visible: the pre-occupied base and the newly activated -2.
+    let all = session_repo::list_for_host(conn, host_id).unwrap();
+    assert_eq!(all.len(), 2, "occupied + new session must both be visible");
 }
 
 /// Claim 2 — Shortname exhaustion: all 50 suffix variants taken → ShortnameExhausted.
@@ -330,6 +334,42 @@ async fn create_main_branch_shortname_exhaustion_errors() {
     assert!(
         matches!(err, MuxError::ShortnameExhausted),
         "expected ShortnameExhausted after all 400 adj-noun pairs are taken, got: {err:?}"
+    );
+}
+
+/// Claim 3b — `master` branch also triggers adj-noun shortname exhaustion.
+///
+/// `is_main` in create.rs covers both "main" and "master"; this test ensures
+/// the same exhaustion path fires for "master" (sibling of Claim 3).
+#[tokio::test]
+async fn create_master_branch_shortname_exhaustion_errors() {
+    let (_dir, store) = open_store();
+    let conn = store.conn();
+    let host = insert_configured_host(conn);
+
+    for (i, adj) in ADJECTIVES.iter().enumerate() {
+        for (j, noun) in NOUNS.iter().enumerate() {
+            let sn = shortname_for_main("myrepo", adj, noun);
+            let uuid = format!("{i:08x}-{j:04x}-1111-0000-000000000000");
+            occupy_shortname(conn, host.id, &uuid, &sn);
+        }
+    }
+
+    let err = run_create(CreateContext {
+        conn,
+        mux_home: Path::new("/home/user/.mux"),
+        repo: repo(),
+        host,
+        branch: "master".to_owned(),
+        ssh: MockSshHost::with_trusted_key(vec![]),
+        is_interactive: false,
+    })
+    .await
+    .unwrap_err();
+
+    assert!(
+        matches!(err, MuxError::ShortnameExhausted),
+        "expected ShortnameExhausted for master branch with all 400 pairs taken, got: {err:?}"
     );
 }
 
@@ -432,10 +472,14 @@ async fn create_clone_failure_issues_rm_rf_on_workdir_parent() {
         "rm -rf must target the mux workdir parent, got: {rm_cmd}"
     );
 
-    // Reservation must be cancelled (list_for_host filters tmux_name IS NOT NULL,
-    // so an in-flight reservation with NULL tmux_name does not appear — confirmed empty).
-    let sessions = session_repo::list_for_host(conn, host_id).unwrap();
-    assert!(sessions.is_empty(), "reservation must be cancelled on clone failure");
+    // Reservation must be cancelled. Use a raw count that includes in-flight rows
+    // (tmux_name IS NULL) — list_for_host would silently exclude them.
+    let row_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sessions WHERE host_id = ?1",
+        params![host_id],
+        |row| row.get(0),
+    ).unwrap();
+    assert_eq!(row_count, 0, "cancel_reservation must delete the reserved row on clone failure");
 }
 
 /// Claim 6 — RPC create_session failure: reservation cancelled and workdir cleaned up.
@@ -501,12 +545,14 @@ async fn create_rpc_failure_cancels_reservation_and_cleans_workdir() {
         "expected an RPC-class error, got: {err:?}"
     );
 
-    // Reservation must be cancelled.
-    let sessions = session_repo::list_for_host(conn, host_id).unwrap();
-    assert!(
-        sessions.is_empty(),
-        "reservation must be cancelled on RPC failure"
-    );
+    // Reservation must be cancelled. Raw count to catch in-flight rows (tmux_name IS NULL)
+    // that list_for_host silently excludes.
+    let row_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sessions WHERE host_id = ?1",
+        params![host_id],
+        |row| row.get(0),
+    ).unwrap();
+    assert_eq!(row_count, 0, "cancel_reservation must delete the reserved row on RPC failure");
 
     // Workdir cleanup must be issued.
     let cmds = commands.borrow();
@@ -516,10 +562,13 @@ async fn create_rpc_failure_cancels_reservation_and_cleans_workdir() {
     );
 }
 
-/// Claim 7 — Active mark (session_repo::activate) is set only after RPC success.
+/// Claim 7 — Happy-path end state: session is active with correct names after RPC success.
 ///
 /// Verifies the full happy path: after a successful RPC round-trip the session
 /// row transitions from reserved (tmux_name IS NULL) to active (tmux_name set).
+///
+/// The *negative* (activate is NOT called when RPC fails) is established by the
+/// failure tests above via raw row-count assertions on the sessions table.
 #[tokio::test]
 async fn create_active_mark_only_set_after_rpc_success() {
     let (_dir, store) = open_store();
@@ -613,9 +662,13 @@ async fn create_rpc_agent_error_cancels_reservation() {
         "expected AgentError for RPC error response, got: {err:?}"
     );
 
-    // Reservation cancelled.
-    let sessions = session_repo::list_for_host(conn, host_id).unwrap();
-    assert!(sessions.is_empty(), "reservation must be cancelled on RPC agent error");
+    // Reservation cancelled. Raw count to catch in-flight rows that list_for_host excludes.
+    let row_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sessions WHERE host_id = ?1",
+        params![host_id],
+        |row| row.get(0),
+    ).unwrap();
+    assert_eq!(row_count, 0, "cancel_reservation must delete the row on RPC agent error");
 
     // Workdir cleanup issued.
     let cmds = commands.borrow();
