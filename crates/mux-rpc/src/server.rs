@@ -1378,6 +1378,75 @@ mod tests {
         assert_eq!(get["error"], "tmux_error", "list_sessions error must propagate via GetSession: {get}");
     }
 
+    // ── Event bus wiring ──────────────────────────────────────────────────────
+
+    async fn start_server_with_bus(
+        mock: MockTmuxOps,
+        bus: Arc<EventBus>,
+    ) -> (std::net::SocketAddr, tokio::sync::broadcast::Receiver<BusEvent>) {
+        let rx = bus.subscribe();
+        let server = RpcServer::with_backend("127.0.0.1:0", mock);
+        let bound = server.bind().await.unwrap().with_event_bus(bus);
+        let addr = bound.local_addr();
+        tokio::spawn(async move {
+            let _ = bound.serve().await;
+        });
+        (addr, rx)
+    }
+
+    #[tokio::test]
+    async fn rpc_bus_publishes_rpc_request_on_success() {
+        use std::time::Duration;
+
+        let bus = Arc::new(EventBus::new());
+        let (addr, mut rx) = start_server_with_bus(MockTmuxOps::new(), bus).await;
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        send_request(&mut stream, &serde_json::json!({"op": "Health"})).await;
+
+        let event = tokio::time::timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .expect("timed out waiting for bus event")
+            .expect("channel closed");
+
+        match event {
+            BusEvent::RpcRequest(e) => {
+                assert_eq!(e.method, "Health", "method must be 'Health'");
+                assert!(e.success, "Health must be success=true");
+            }
+            other => panic!("expected BusEvent::RpcRequest, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn rpc_bus_publishes_rpc_request_with_success_false_on_error() {
+        use std::time::Duration;
+
+        let bus = Arc::new(EventBus::new());
+        let (addr, mut rx) = start_server_with_bus(MockTmuxOps::new(), bus).await;
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        // GetSession for a UUID that doesn't exist → not_found error → success=false
+        send_request(
+            &mut stream,
+            &serde_json::json!({"op": "GetSession", "uuid": "00000000-0000-0000-0000-000000000000"}),
+        )
+        .await;
+
+        let event = tokio::time::timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .expect("timed out waiting for bus event")
+            .expect("channel closed");
+
+        match event {
+            BusEvent::RpcRequest(e) => {
+                assert_eq!(e.method, "GetSession", "method must be 'GetSession'");
+                assert!(!e.success, "not_found error must be success=false");
+            }
+            other => panic!("expected BusEvent::RpcRequest, got: {other:?}"),
+        }
+    }
+
     // ── ListSessions multiple sessions ────────────────────────────────────────
 
     #[tokio::test]

@@ -8,6 +8,7 @@ members = [
     "crates/mux-ssh",
     "crates/mux-rpc",
     "crates/mux-tmux",
+    "tests/observability",
 ]
 resolver = "2"
 
