@@ -17,11 +17,15 @@ lint:
 test-unit:
 	cargo test --workspace
 
-# Integration tests (placeholder until mux-3bv scaffolds the test environment)
+# Integration tests — requires Docker and the mux binary to be built first.
+# Usage:
+#   make build && make test-integration          # uses target/debug/mux
+#   MUX_BIN=/path/to/mux make test-integration  # explicit binary path
 test-integration:
-	@echo "Integration test environment not yet configured — see mux-3bv"
+	cargo test -p mux-integration-tests --test integration --features integration-tests -- --test-threads=1
 
 # All tests (unit + integration)
+# Note: test-integration requires Docker; use test-unit for Docker-free runs.
 test: test-unit test-integration
 
 # Debug build of both binaries
