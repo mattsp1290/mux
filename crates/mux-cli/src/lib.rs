@@ -7,6 +7,7 @@ use clap_complete::generate;
 pub mod agent_start;
 pub mod create;
 pub mod host;
+pub mod kill;
 pub mod mux_home;
 
 /// The full mux CLI definition, exported so `mux-cli` can generate completions.
@@ -53,7 +54,10 @@ pub enum Command {
     /// Show session status
     Status,
     /// Kill a session
-    Kill,
+    Kill {
+        /// UUID or shortname of the session to kill
+        selector: String,
+    },
     /// Generate shell completions
     Completions {
         /// Shell to generate completions for
@@ -128,7 +132,9 @@ pub async fn run(command: Command, mux_home: PathBuf) -> Result<()> {
         Command::Attach => todo!("mux attach"),
         Command::List => todo!("mux list"),
         Command::Status => todo!("mux status"),
-        Command::Kill => todo!("mux kill"),
+        // TODO: wire to run_kill once a real SshHost SSH impl lands (currently no
+        // production SSH executor exists; kill is tested via MockSshHost in isolation).
+        Command::Kill { .. } => anyhow::bail!("mux kill: SSH execution not yet implemented"),
     }
 }
 

@@ -123,6 +123,27 @@ pub fn get_by_uuid(conn: &Connection, uuid: &str) -> Result<Option<Session>> {
     .context("get session by uuid")
 }
 
+/// Fetch all activated sessions matching a shortname, across all hosts.
+///
+/// Used by selector resolution when the caller has no host context.
+/// Returns multiple rows when the same shortname exists on different hosts —
+/// callers must decide how to handle ambiguity.
+pub fn get_by_shortname_global(conn: &Connection, shortname: &str) -> Result<Vec<Session>> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {SESSION_COLUMNS} FROM sessions \
+             WHERE shortname = ?1 AND tmux_name IS NOT NULL \
+             ORDER BY created_at ASC"
+        ))
+        .context("prepare get_by_shortname_global")?;
+    let rows = stmt
+        .query_map(params![shortname], map_session)
+        .context("query get_by_shortname_global")?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("collect get_by_shortname_global rows")?;
+    Ok(rows)
+}
+
 /// Fetch an activated session by host + shortname (excludes in-flight reservations).
 pub fn get_by_shortname(
     conn: &Connection,
