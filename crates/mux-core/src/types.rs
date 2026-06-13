@@ -195,8 +195,13 @@ impl std::fmt::Display for Endpoint {
 /// - `owner/repo` → owner and repo extracted, host=None.
 /// - `git@host:path.git` → owner/repo extracted from path, host=Some(host).
 /// - `owner/repo.git` shorthand is explicitly **rejected** (ambiguous `.git` suffix).
+/// - `.git` suffix is matched case-insensitively (after lowercasing the path).
 /// - Owner and repo are lowercased and stored canonically.
 /// - An empty owner or repo component is rejected.
+/// - Owner and repo must each contain at least one ASCII alphanumeric character to
+///   guarantee a non-empty `storage_slug` (a filesystem path component).
+/// - `Display` always produces the canonical form: `git@host:owner/repo.git` for
+///   git@ inputs (with `.git` re-added if it was absent), `owner/repo` for slug inputs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoRef {
     owner: String,
@@ -248,7 +253,7 @@ impl RepoRef {
     }
 
     /// Git clone URL, using the stored host or `default_host` if none was parsed.
-    pub fn clone_url_for<'a>(&'a self, default_host: &'a str) -> String {
+    pub fn clone_url_for(&self, default_host: &str) -> String {
         let h = self.host.as_deref().unwrap_or(default_host);
         format!("git@{}:{}/{}.git", h, self.owner, self.repo)
     }
@@ -269,16 +274,19 @@ impl std::str::FromStr for RepoRef {
             // Parse git@host:owner/repo.git
             let colon = rest.find(':').ok_or_else(err)?;
             let host = rest[..colon].to_ascii_lowercase();
-            let path = &rest[colon + 1..];
-            // Strip exactly one trailing ".git"
-            let path = path.strip_suffix(".git").unwrap_or(path);
+            // Lowercase before stripping ".git" so "r.GIT" is treated the same as "r.git".
+            let path_lower = rest[colon + 1..].to_ascii_lowercase();
+            let path = path_lower.strip_suffix(".git").unwrap_or(&path_lower);
             let slash = path.find('/').ok_or_else(err)?;
-            let owner = path[..slash].to_ascii_lowercase();
-            let repo = path[slash + 1..].to_ascii_lowercase();
-            if owner.is_empty() || repo.is_empty() || repo.contains('/') {
-                return Err(err());
-            }
-            if host.is_empty() {
+            let owner = path[..slash].to_owned();
+            let repo = path[slash + 1..].to_owned();
+            if owner.is_empty()
+                || repo.is_empty()
+                || repo.contains('/')
+                || host.is_empty()
+                || !owner.chars().any(|c| c.is_ascii_alphanumeric())
+                || !repo.chars().any(|c| c.is_ascii_alphanumeric())
+            {
                 return Err(err());
             }
             Ok(RepoRef {
@@ -287,16 +295,22 @@ impl std::str::FromStr for RepoRef {
                 host: Some(host),
             })
         } else {
-            // Parse owner/repo — reject owner/repo.git shorthand
-            if s.ends_with(".git") {
+            // Parse owner/repo — reject owner/repo.git shorthand (case-insensitive)
+            let s_lower = s.to_ascii_lowercase();
+            if s_lower.ends_with(".git") {
                 return Err(MuxError::InvalidRepo(format!(
                     "{s}: use 'owner/repo' not 'owner/repo.git'"
                 )));
             }
-            let slash = s.find('/').ok_or_else(err)?;
-            let owner = s[..slash].to_ascii_lowercase();
-            let repo = s[slash + 1..].to_ascii_lowercase();
-            if owner.is_empty() || repo.is_empty() || repo.contains('/') {
+            let slash = s_lower.find('/').ok_or_else(err)?;
+            let owner = s_lower[..slash].to_owned();
+            let repo = s_lower[slash + 1..].to_owned();
+            if owner.is_empty()
+                || repo.is_empty()
+                || repo.contains('/')
+                || !owner.chars().any(|c| c.is_ascii_alphanumeric())
+                || !repo.chars().any(|c| c.is_ascii_alphanumeric())
+            {
                 return Err(err());
             }
             Ok(RepoRef {
@@ -733,5 +747,35 @@ mod tests {
         assert!("git@github.com/mattsp1290/mux.git"
             .parse::<RepoRef>()
             .is_err());
+    }
+
+    #[test]
+    fn repo_ref_git_url_case_insensitive_dot_git() {
+        // .GIT and .Git should be stripped the same as .git
+        let r: RepoRef = "git@github.com:mattsp1290/mux.GIT".parse().unwrap();
+        assert_eq!(r.repo(), "mux", ".GIT should be stripped");
+        let r: RepoRef = "git@github.com:mattsp1290/mux.Git".parse().unwrap();
+        assert_eq!(r.repo(), "mux", ".Git should be stripped");
+    }
+
+    #[test]
+    fn repo_ref_rejects_non_alnum_only_owner() {
+        // All-non-alnum owner would produce empty storage_slug
+        assert!("_/repo".parse::<RepoRef>().is_err());
+        assert!("./repo".parse::<RepoRef>().is_err());
+    }
+
+    #[test]
+    fn repo_ref_rejects_non_alnum_only_repo() {
+        // All-non-alnum repo would produce empty storage_slug
+        assert!("owner/_".parse::<RepoRef>().is_err());
+        assert!("owner/.".parse::<RepoRef>().is_err());
+    }
+
+    #[test]
+    fn repo_ref_git_url_no_dot_git_display_adds_git() {
+        // Display always produces canonical form (with .git), even when input lacked it
+        let r: RepoRef = "git@github.com:mattsp1290/mux".parse().unwrap();
+        assert_eq!(r.to_string(), "git@github.com:mattsp1290/mux.git");
     }
 }

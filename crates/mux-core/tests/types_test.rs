@@ -365,3 +365,23 @@ fn repo_ref_error_message_contains_input() {
     let err = "not/valid/repo".parse::<RepoRef>().unwrap_err();
     assert!(err.to_string().contains("not/valid/repo"));
 }
+
+// Error-prefix assertions (mux-7q3 acceptance criterion: "error prefixes")
+
+#[test]
+fn error_prefixes() {
+    let err = "bad.alias".parse::<HostAlias>().unwrap_err();
+    assert!(err.to_string().starts_with("invalid host alias:"));
+
+    let err = "0".parse::<Port>().unwrap_err();
+    assert!(err.to_string().starts_with("invalid port:"));
+
+    let err = "noat".parse::<Endpoint>().unwrap_err();
+    assert!(err.to_string().starts_with("invalid endpoint:"));
+
+    let err = "DEAD".parse::<SessionStatus>().unwrap_err();
+    assert!(err.to_string().starts_with("invalid session status:"));
+
+    let err = "notenough".parse::<RepoRef>().unwrap_err();
+    assert!(err.to_string().starts_with("invalid repo:"));
+}
