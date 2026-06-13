@@ -474,6 +474,7 @@ dependencies = [
  "anyhow",
  "mux-rpc",
  "mux-tmux",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -517,6 +518,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "mux-core",
+ "mux-tmux",
  "serde",
  "serde_json",
  "thiserror",

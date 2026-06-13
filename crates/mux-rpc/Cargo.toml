@@ -8,6 +8,7 @@ description = "mux RPC client/server bindings"
 
 [dependencies]
 mux-core = { path = "../mux-core" }
+mux-tmux = { path = "../mux-tmux" }
 anyhow.workspace = true
 thiserror.workspace = true
 serde.workspace = true
