@@ -246,4 +246,53 @@ mod tests {
             "no config file should be created by init; found: {entries:?}"
         );
     }
+
+    // ── migration application ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn init_applies_migrations_creates_schema() {
+        use rusqlite::Connection;
+        let tmp = TempDir::new().unwrap();
+        let mux_home = tmp.path().join(".mux");
+        run(Command::Init, mux_home.clone()).await.unwrap();
+
+        let conn = Connection::open(mux_home.join("mux.db")).unwrap();
+        // Subset check (not exact-match): asserts all known tables are present without
+        // breaking if SQLite adds internal tables in future versions.
+        let tables: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+
+        for expected in &["_migrations", "agent_versions", "hosts", "known_host_fingerprints", "sessions"] {
+            assert!(
+                tables.iter().any(|t| t == expected),
+                "expected table '{expected}' in schema, got: {tables:?}"
+            );
+        }
+    }
+
+    // ── home-dir failure ──────────────────────────────────────────────────────
+
+    // #[cfg(unix)]: std::fs::write creates the file cross-platform, but the
+    // create_dir_all ENOTDIR error surfaces differently on Windows. Unix is the
+    // only supported target for mux (tmux dependency), so the gate is intentional.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn init_fails_when_mux_home_blocked_by_file() {
+        let tmp = TempDir::new().unwrap();
+        // Place a regular file where mux_home directory should be.
+        let mux_home = tmp.path().join(".mux");
+        std::fs::write(&mux_home, b"blocker").unwrap();
+        // Store::open calls create_dir_all(mux_home) which fails (ENOTDIR) because
+        // mux_home is a regular file. Connection::open is never reached.
+        let err = run(Command::Init, mux_home).await.unwrap_err();
+        assert!(
+            err.to_string().contains("create state directory"),
+            "expected 'create state directory' context in error, got: {err}"
+        );
+    }
 }
