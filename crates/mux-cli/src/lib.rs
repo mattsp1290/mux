@@ -1,5 +1,22 @@
+use std::path::PathBuf;
+
 use anyhow::Result;
-use clap::Subcommand;
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::generate;
+
+pub mod mux_home;
+
+/// The full mux CLI definition, exported so `mux-cli` can generate completions.
+#[derive(Debug, Parser)]
+#[command(name = "mux", about = "tmux session manager", version)]
+pub struct Cli {
+    /// Override the mux state directory (default: $MUX_HOME or ~/.mux)
+    #[arg(long, global = true)]
+    pub mux_home: Option<PathBuf>,
+
+    #[command(subcommand)]
+    pub command: Command,
+}
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
@@ -56,8 +73,14 @@ pub enum AgentAction {
     Stop,
 }
 
-pub async fn run(command: Command) -> Result<()> {
+pub async fn run(command: Command, _mux_home: PathBuf) -> Result<()> {
     match command {
+        Command::Completions { shell } => {
+            let mut cmd = Cli::command();
+            let name = cmd.get_name().to_string();
+            generate(shell, &mut cmd, &name, &mut std::io::stdout());
+            Ok(())
+        }
         Command::Init => todo!("mux init"),
         Command::Host { .. } => todo!("mux host"),
         Command::Agent { .. } => todo!("mux agent"),
@@ -66,6 +89,5 @@ pub async fn run(command: Command) -> Result<()> {
         Command::List => todo!("mux list"),
         Command::Status => todo!("mux status"),
         Command::Kill => todo!("mux kill"),
-        Command::Completions { .. } => todo!("mux completions"),
     }
 }
