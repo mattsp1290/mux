@@ -47,6 +47,102 @@ impl std::fmt::Display for HostAlias {
     }
 }
 
+/// A validated SSH port number (1–65535).
+///
+/// Port 0 is rejected: it is the kernel-assigned ephemeral port and is never a valid
+/// explicit SSH target. Port numbers above 65535 cannot exist on TCP/IP.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+pub struct Port(u16);
+
+impl Port {
+    pub fn value(self) -> u16 {
+        self.0
+    }
+}
+
+impl std::str::FromStr for Port {
+    type Err = MuxError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let n: u32 = s.parse().map_err(|_| MuxError::InvalidPort(s.to_owned()))?;
+        if (1..=65535).contains(&n) {
+            Ok(Port(n as u16))
+        } else {
+            Err(MuxError::InvalidPort(s.to_owned()))
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Port {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Accept either a JSON number or a quoted string.
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum NumOrStr {
+            Num(u32),
+            Str(String),
+        }
+        let v = NumOrStr::deserialize(deserializer)?;
+        let n = match v {
+            NumOrStr::Num(n) => n,
+            NumOrStr::Str(s) => s
+                .parse::<u32>()
+                .map_err(|_| serde::de::Error::custom(format!("invalid port: {s}")))?,
+        };
+        if (1..=65535).contains(&n) {
+            Ok(Port(n as u16))
+        } else {
+            Err(serde::de::Error::custom(format!("invalid port: {n}")))
+        }
+    }
+}
+
+impl std::fmt::Display for Port {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl Default for Port {
+    fn default() -> Self {
+        Port(22)
+    }
+}
+
+/// A remote SSH endpoint in `user@addr` form.
+///
+/// `user` is a Unix username (no `@`). `addr` is a hostname or IP address (no `@`).
+/// The spec (docs/01 §mux host add) does not specify further constraints on username
+/// or address format; validation is conservative (non-empty, no `@` in either component).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Endpoint {
+    pub user: String,
+    pub addr: String,
+}
+
+impl std::str::FromStr for Endpoint {
+    type Err = MuxError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let mut parts = s.splitn(2, '@');
+        let user = parts.next().unwrap_or("").to_owned();
+        let addr = parts.next().unwrap_or("").to_owned();
+        if user.is_empty() || addr.is_empty() || user.contains('@') || addr.contains('@') {
+            return Err(MuxError::InvalidEndpoint(s.to_owned()));
+        }
+        Ok(Endpoint { user, addr })
+    }
+}
+
+impl std::fmt::Display for Endpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}@{}", self.user, self.addr)
+    }
+}
+
 /// Transport mode selected for a host.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -227,5 +323,101 @@ mod tests {
     fn session_selector_falls_back_to_shortname() {
         let sel: SessionSelector = "my-session".parse().unwrap();
         assert_eq!(sel, SessionSelector::Shortname("my-session".to_owned()));
+    }
+
+    #[test]
+    fn port_valid() {
+        assert_eq!("22".parse::<Port>().unwrap().value(), 22);
+        assert_eq!("1".parse::<Port>().unwrap().value(), 1);
+        assert_eq!("65535".parse::<Port>().unwrap().value(), 65535);
+    }
+
+    #[test]
+    fn port_rejects_zero() {
+        assert!("0".parse::<Port>().is_err());
+    }
+
+    #[test]
+    fn port_rejects_above_max() {
+        assert!("65536".parse::<Port>().is_err());
+        assert!("99999".parse::<Port>().is_err());
+    }
+
+    #[test]
+    fn port_rejects_non_numeric() {
+        assert!("ssh".parse::<Port>().is_err());
+        assert!("".parse::<Port>().is_err());
+        assert!("-1".parse::<Port>().is_err());
+    }
+
+    #[test]
+    fn port_default_is_22() {
+        assert_eq!(Port::default().value(), 22);
+    }
+
+    #[test]
+    fn port_display() {
+        assert_eq!(Port::default().to_string(), "22");
+    }
+
+    #[test]
+    fn port_serde_from_number() {
+        let p: Port = serde_json::from_str("22").unwrap();
+        assert_eq!(p.value(), 22);
+    }
+
+    #[test]
+    fn port_serde_from_string() {
+        let p: Port = serde_json::from_str(r#""8022""#).unwrap();
+        assert_eq!(p.value(), 8022);
+    }
+
+    #[test]
+    fn port_serde_rejects_zero() {
+        assert!(serde_json::from_str::<Port>("0").is_err());
+    }
+
+    #[test]
+    fn endpoint_valid() {
+        let ep: Endpoint = "alice@192.168.1.1".parse().unwrap();
+        assert_eq!(ep.user, "alice");
+        assert_eq!(ep.addr, "192.168.1.1");
+    }
+
+    #[test]
+    fn endpoint_valid_hostname() {
+        let ep: Endpoint = "bob@host.example.com".parse().unwrap();
+        assert_eq!(ep.user, "bob");
+        assert_eq!(ep.addr, "host.example.com");
+    }
+
+    #[test]
+    fn endpoint_display_roundtrip() {
+        let s = "alice@192.168.1.1";
+        let ep: Endpoint = s.parse().unwrap();
+        assert_eq!(ep.to_string(), s);
+    }
+
+    #[test]
+    fn endpoint_rejects_missing_at() {
+        assert!("alice".parse::<Endpoint>().is_err());
+        assert!("".parse::<Endpoint>().is_err());
+    }
+
+    #[test]
+    fn endpoint_rejects_empty_user() {
+        assert!("@host.example.com".parse::<Endpoint>().is_err());
+    }
+
+    #[test]
+    fn endpoint_rejects_empty_addr() {
+        assert!("alice@".parse::<Endpoint>().is_err());
+    }
+
+    #[test]
+    fn endpoint_rejects_multiple_at() {
+        // Only the first @ is the user/addr separator; a second @ in user is impossible
+        // given splitn(2), but addr containing @ must be rejected.
+        assert!("alice@host@extra".parse::<Endpoint>().is_err());
     }
 }
