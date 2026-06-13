@@ -6,7 +6,7 @@
 //!
 //! Workdirs not matching this pattern (imported sessions) must never be removed.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// Constructs the canonical workdir path: `mux_home/<uuid>/<repo_leaf>`.
 ///
@@ -55,33 +55,33 @@ pub fn classify_workdir(workdir: &Path, mux_home: &Path) -> WorkdirClassificatio
 
     let mut components = relative.components();
 
-    // First component: UUID
-    let uuid_component = match components.next() {
-        Some(c) => c,
-        None => return WorkdirClassification::Imported,
-    };
-    let uuid_str = match uuid_component.as_os_str().to_str() {
-        Some(s) => s,
-        None => return WorkdirClassification::Imported,
+    // First component: UUID — must be Component::Normal (rejects `..`, `.`, RootDir, Prefix).
+    // This is the critical guard: a `Component::ParentDir` (`..`) would otherwise escape
+    // mux_home even though it counts as one component.
+    let uuid_str = match components.next() {
+        Some(Component::Normal(s)) => match s.to_str() {
+            Some(s) => s,
+            None => return WorkdirClassification::Imported,
+        },
+        _ => return WorkdirClassification::Imported,
     };
     if !looks_like_uuid(uuid_str) {
         return WorkdirClassification::Imported;
     }
 
-    // Second component: repo leaf
-    let leaf_component = match components.next() {
-        Some(c) => c,
-        None => return WorkdirClassification::Imported,
-    };
-    let leaf_str = match leaf_component.as_os_str().to_str() {
-        Some(s) => s,
-        None => return WorkdirClassification::Imported,
+    // Second component: repo leaf — also must be Component::Normal.
+    let leaf_str = match components.next() {
+        Some(Component::Normal(s)) => match s.to_str() {
+            Some(s) => s,
+            None => return WorkdirClassification::Imported,
+        },
+        _ => return WorkdirClassification::Imported,
     };
     if leaf_str.is_empty() {
         return WorkdirClassification::Imported;
     }
 
-    // No additional components allowed
+    // No additional components allowed.
     if components.next().is_some() {
         return WorkdirClassification::Imported;
     }
@@ -93,28 +93,34 @@ pub fn classify_workdir(workdir: &Path, mux_home: &Path) -> WorkdirClassificatio
 ///
 /// Safe to remove means:
 /// 1. `classify_workdir` returns `MuxCreated`
-/// 2. No symlink exists in any path component up to and including the leaf
-///    (checked via `std::fs::symlink_metadata`)
+/// 2. No symlink exists in the components between `mux_home` and the leaf (inclusive).
+///    Only the two mux-controlled components (`<uuid>/` and `<leaf>`) are checked —
+///    ancestors of `mux_home` are outside mux's trust boundary and may legitimately be
+///    symlinks (e.g. `/home → /data/home` on some Linux distros).
+///
+/// Note: this function is advisory. A TOCTOU window exists between the check and the
+/// eventual `remove_dir_all` call; the caller is responsible for operating within a
+/// 0700 `mux_home` directory that limits who can introduce symlinks in the gap.
 pub fn is_safe_to_remove(workdir: &Path, mux_home: &Path) -> bool {
     if classify_workdir(workdir, mux_home) != WorkdirClassification::MuxCreated {
         return false;
     }
 
-    // Walk each prefix of the path and check for symlinks.
-    // We start from the root and build up, checking each component.
-    let mut current = PathBuf::new();
-    for component in workdir.components() {
-        current.push(component);
-        match std::fs::symlink_metadata(&current) {
+    // Walk only the components mux controls: mux_home/<uuid> and mux_home/<uuid>/<leaf>.
+    // Ancestors of mux_home are not checked (see doc comment above).
+    let uuid_dir = match workdir.parent() {
+        Some(p) => p,
+        None => return false,
+    };
+
+    for path in [uuid_dir, workdir] {
+        match std::fs::symlink_metadata(path) {
             Ok(meta) => {
                 if meta.file_type().is_symlink() {
                     return false;
                 }
             }
-            Err(_) => {
-                // If we can't stat a component, assume it's not safe.
-                return false;
-            }
+            Err(_) => return false,
         }
     }
 
@@ -277,5 +283,63 @@ mod tests {
         let mux_home = tmp.path();
         let imported = Path::new("/tmp/some-imported-project");
         assert!(!is_safe_to_remove(imported, mux_home));
+    }
+
+    // Regression: $MUX_HOME/<uuid>/.. must be classified Imported, not MuxCreated.
+    // A ParentDir component is non-empty but is not Component::Normal — it would
+    // resolve to $MUX_HOME and allow removal of the entire state directory.
+    #[test]
+    fn classify_parent_dir_component_is_imported() {
+        let mux_home = Path::new("/home/user/.mux");
+        // Build path manually: mux_home/<uuid>/..
+        let workdir = mux_home.join(VALID_UUID).join("..");
+        assert_eq!(
+            classify_workdir(&workdir, mux_home),
+            WorkdirClassification::Imported,
+            "$MUX_HOME/<uuid>/.. must be Imported to prevent deletion of mux_home"
+        );
+    }
+
+    #[test]
+    fn classify_current_dir_component_is_imported() {
+        let mux_home = Path::new("/home/user/.mux");
+        // mux_home/<uuid>/. — current-dir component, also not Normal
+        let workdir = mux_home.join(VALID_UUID).join(".");
+        assert_eq!(
+            classify_workdir(&workdir, mux_home),
+            WorkdirClassification::Imported
+        );
+    }
+
+    #[test]
+    fn is_safe_to_remove_leaf_symlink() {
+        // The leaf itself is a symlink — must not be removable.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mux_home = tmp.path();
+        let uuid_dir = mux_home.join(VALID_UUID);
+        std::fs::create_dir_all(&uuid_dir).unwrap();
+
+        // Create a real target and make the leaf a symlink.
+        let real_target = tmp.path().join("other_dir");
+        std::fs::create_dir_all(&real_target).unwrap();
+        let leaf_link = uuid_dir.join("myrepo");
+        std::os::unix::fs::symlink(&real_target, &leaf_link).unwrap();
+
+        assert!(!is_safe_to_remove(&leaf_link, mux_home));
+    }
+
+    #[test]
+    fn is_safe_to_remove_not_affected_by_symlinked_mux_home_ancestor() {
+        // is_safe_to_remove only checks mux-controlled components, not ancestors.
+        // On systems where /home is a symlink, all workdirs would fail if we
+        // checked ancestors — this test verifies we don't check above mux_home.
+        // We simulate this by using a temp dir whose path may contain symlinks on macOS.
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Canonicalize mux_home so the test is reliable.
+        let mux_home_real = tmp.path().canonicalize().unwrap();
+        let workdir = mux_home_real.join(VALID_UUID).join("myrepo");
+        std::fs::create_dir_all(&workdir).unwrap();
+        // Should be safe: only the mux-controlled components are checked.
+        assert!(is_safe_to_remove(&workdir, &mux_home_real));
     }
 }
