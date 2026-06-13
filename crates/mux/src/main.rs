@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
@@ -11,11 +9,23 @@ async fn main() {
 
     let cli = mux_cli::Cli::parse();
 
-    let mux_home: PathBuf = match mux_cli::mux_home::resolve_mux_home(cli.mux_home) {
+    // Completions do not need a state directory — handle before resolve_mux_home so
+    // that `mux completions bash` works in environments without HOME.
+    if let mux_cli::Command::Completions { .. } = &cli.command {
+        match mux_cli::run(cli.command, std::path::PathBuf::new()).await {
+            Ok(()) => return,
+            Err(e) => {
+                eprintln!("mux: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    let mux_home = match mux_cli::mux_home::resolve_mux_home(cli.mux_home) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("mux: {e}");
-            std::process::exit(1);
+            std::process::exit(e.exit_code());
         }
     };
 

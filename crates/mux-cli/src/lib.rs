@@ -11,7 +11,7 @@ pub mod mux_home;
 #[command(name = "mux", about = "tmux session manager", version)]
 pub struct Cli {
     /// Override the mux state directory (default: $MUX_HOME or ~/.mux)
-    #[arg(long, global = true, env = "MUX_HOME")]
+    #[arg(long, global = true)]
     pub mux_home: Option<PathBuf>,
 
     #[command(subcommand)]
@@ -77,7 +77,8 @@ pub async fn run(command: Command, _mux_home: PathBuf) -> Result<()> {
     match command {
         Command::Completions { shell } => {
             let mut cmd = Cli::command();
-            generate(shell, &mut cmd, "mux", &mut std::io::stdout());
+            let name = cmd.get_name().to_string();
+            generate(shell, &mut cmd, &name, &mut std::io::stdout());
             Ok(())
         }
         Command::Init => todo!("mux init"),

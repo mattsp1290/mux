@@ -1,5 +1,3 @@
-// MUX_HOME resolution per docs/01 §Global behaviour
-
 use std::path::PathBuf;
 
 use mux_core::error::MuxError;
@@ -7,25 +5,35 @@ use mux_core::error::MuxError;
 /// Resolve the mux state directory.
 ///
 /// Priority order:
-/// 1. `override_path` if Some (from --mux-home CLI flag)
-/// 2. `MUX_HOME` environment variable
-/// 3. `~/.mux` (home directory from HOME env var)
+/// 1. `override_path` if `Some` (from `--mux-home` CLI flag)
+/// 2. `MUX_HOME` environment variable (if set and non-empty)
+/// 3. `~/.mux` (home directory from `HOME` env var — Unix-only; mux targets Unix/tmux)
 ///
-/// Returns MuxError::HomeDirNotFound if home cannot be determined.
+/// Returns `MuxError::HomeDirNotFound` if home cannot be determined.
 pub fn resolve_mux_home(override_path: Option<PathBuf>) -> Result<PathBuf, MuxError> {
+    let mux_home_env = std::env::var("MUX_HOME").ok();
+    let home_env = std::env::var("HOME").ok();
+    resolve_mux_home_from(override_path, mux_home_env.as_deref(), home_env.as_deref())
+}
+
+/// Pure resolution logic — accepts env values as parameters to allow testing
+/// without mutating global process state.
+fn resolve_mux_home_from(
+    override_path: Option<PathBuf>,
+    mux_home_env: Option<&str>,
+    home_env: Option<&str>,
+) -> Result<PathBuf, MuxError> {
     if let Some(path) = override_path {
         return Ok(path);
     }
-    if let Ok(val) = std::env::var("MUX_HOME") {
+    if let Some(val) = mux_home_env {
         if !val.is_empty() {
             return Ok(PathBuf::from(val));
         }
     }
-    // Fall back to ~/.mux
-    let home = std::env::var("HOME")
-        .ok()
+    let home = home_env
+        .filter(|s| !s.is_empty())
         .map(PathBuf::from)
-        .filter(|p| !p.as_os_str().is_empty())
         .ok_or(MuxError::HomeDirNotFound)?;
     Ok(home.join(".mux"))
 }
@@ -34,70 +42,51 @@ pub fn resolve_mux_home(override_path: Option<PathBuf>) -> Result<PathBuf, MuxEr
 mod tests {
     use super::*;
 
+    fn r(
+        override_path: Option<PathBuf>,
+        mux_home_env: Option<&str>,
+        home_env: Option<&str>,
+    ) -> Result<PathBuf, MuxError> {
+        resolve_mux_home_from(override_path, mux_home_env, home_env)
+    }
+
     #[test]
     fn override_path_takes_priority() {
         let path = PathBuf::from("/custom/mux/home");
-        let result = resolve_mux_home(Some(path.clone())).unwrap();
+        let result = r(Some(path.clone()), Some("/env/mux"), Some("/home/user")).unwrap();
         assert_eq!(result, path);
     }
 
     #[test]
-    fn mux_home_env_var_used() {
-        // Save and restore to minimise cross-test pollution (tests run in-process).
-        let prev = std::env::var("MUX_HOME").ok();
-        std::env::set_var("MUX_HOME", "/env/mux/home");
-
-        let result = resolve_mux_home(None).unwrap();
+    fn mux_home_env_used_when_no_override() {
+        let result = r(None, Some("/env/mux/home"), Some("/home/user")).unwrap();
         assert_eq!(result, PathBuf::from("/env/mux/home"));
-
-        // Restore
-        match prev {
-            Some(v) => std::env::set_var("MUX_HOME", v),
-            None => std::env::remove_var("MUX_HOME"),
-        }
     }
 
     #[test]
     fn defaults_to_dot_mux() {
-        let prev_mux = std::env::var("MUX_HOME").ok();
-        let prev_home = std::env::var("HOME").ok();
-
-        std::env::remove_var("MUX_HOME");
-        std::env::set_var("HOME", "/home/testuser");
-
-        let result = resolve_mux_home(None).unwrap();
+        let result = r(None, None, Some("/home/testuser")).unwrap();
         assert_eq!(result, PathBuf::from("/home/testuser/.mux"));
-
-        // Restore
-        match prev_mux {
-            Some(v) => std::env::set_var("MUX_HOME", v),
-            None => std::env::remove_var("MUX_HOME"),
-        }
-        match prev_home {
-            Some(v) => std::env::set_var("HOME", v),
-            None => std::env::remove_var("HOME"),
-        }
     }
 
     #[test]
     fn empty_mux_home_falls_back() {
-        let prev_mux = std::env::var("MUX_HOME").ok();
-        let prev_home = std::env::var("HOME").ok();
-
-        std::env::set_var("MUX_HOME", "");
-        std::env::set_var("HOME", "/home/fallback");
-
-        let result = resolve_mux_home(None).unwrap();
+        let result = r(None, Some(""), Some("/home/fallback")).unwrap();
         assert_eq!(result, PathBuf::from("/home/fallback/.mux"));
+    }
 
-        // Restore
-        match prev_mux {
-            Some(v) => std::env::set_var("MUX_HOME", v),
-            None => std::env::remove_var("MUX_HOME"),
-        }
-        match prev_home {
-            Some(v) => std::env::set_var("HOME", v),
-            None => std::env::remove_var("HOME"),
-        }
+    #[test]
+    fn home_dir_not_found_when_home_missing() {
+        let err = r(None, None, None).unwrap_err();
+        assert!(
+            matches!(err, MuxError::HomeDirNotFound),
+            "expected HomeDirNotFound, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn home_dir_not_found_when_home_empty() {
+        let err = r(None, None, Some("")).unwrap_err();
+        assert!(matches!(err, MuxError::HomeDirNotFound));
     }
 }
