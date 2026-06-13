@@ -187,6 +187,136 @@ impl std::fmt::Display for Endpoint {
     }
 }
 
+/// A normalised repository reference, parsed from `owner/repo` or `git@host:path.git` forms.
+///
+/// Spec: docs/02 §Repo normalisation
+///
+/// Rules:
+/// - `owner/repo` → owner and repo extracted, host=None.
+/// - `git@host:path.git` → owner/repo extracted from path, host=Some(host).
+/// - `owner/repo.git` shorthand is explicitly **rejected** (ambiguous `.git` suffix).
+/// - Owner and repo are lowercased and stored canonically.
+/// - An empty owner or repo component is rejected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoRef {
+    owner: String,
+    repo: String,
+    host: Option<String>,
+}
+
+impl RepoRef {
+    pub fn owner(&self) -> &str {
+        &self.owner
+    }
+
+    pub fn repo(&self) -> &str {
+        &self.repo
+    }
+
+    pub fn host(&self) -> Option<&str> {
+        self.host.as_deref()
+    }
+
+    /// Canonical owner/repo identifier used in storage and RPC comparisons.
+    pub fn repo_slug(&self) -> String {
+        format!("{}/{}", self.owner, self.repo)
+    }
+
+    /// Filesystem-safe identifier: lowercase, non-alnum replaced with hyphens.
+    pub fn storage_slug(&self) -> String {
+        let raw = format!("{}-{}", self.owner, self.repo);
+        let mut slug = String::new();
+        let mut prev_hyphen = false;
+        for c in raw.chars() {
+            if c.is_ascii_alphanumeric() {
+                slug.push(c);
+                prev_hyphen = false;
+            } else if !prev_hyphen {
+                slug.push('-');
+                prev_hyphen = true;
+            }
+        }
+        slug.trim_matches('-').to_owned()
+    }
+
+    /// Git clone URL. Requires a host — returns `None` if no host was present in the input.
+    /// Use `clone_url_for` to supply a fallback host.
+    pub fn clone_url(&self) -> Option<String> {
+        self.host
+            .as_ref()
+            .map(|h| format!("git@{}:{}/{}.git", h, self.owner, self.repo))
+    }
+
+    /// Git clone URL, using the stored host or `default_host` if none was parsed.
+    pub fn clone_url_for<'a>(&'a self, default_host: &'a str) -> String {
+        let h = self.host.as_deref().unwrap_or(default_host);
+        format!("git@{}:{}/{}.git", h, self.owner, self.repo)
+    }
+
+    /// The `repo` component — used as the working-directory leaf name.
+    pub fn repo_leaf(&self) -> &str {
+        &self.repo
+    }
+}
+
+impl std::str::FromStr for RepoRef {
+    type Err = MuxError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let err = || MuxError::InvalidRepo(s.to_owned());
+
+        if let Some(rest) = s.strip_prefix("git@") {
+            // Parse git@host:owner/repo.git
+            let colon = rest.find(':').ok_or_else(err)?;
+            let host = rest[..colon].to_ascii_lowercase();
+            let path = &rest[colon + 1..];
+            // Strip exactly one trailing ".git"
+            let path = path.strip_suffix(".git").unwrap_or(path);
+            let slash = path.find('/').ok_or_else(err)?;
+            let owner = path[..slash].to_ascii_lowercase();
+            let repo = path[slash + 1..].to_ascii_lowercase();
+            if owner.is_empty() || repo.is_empty() || repo.contains('/') {
+                return Err(err());
+            }
+            if host.is_empty() {
+                return Err(err());
+            }
+            Ok(RepoRef {
+                owner,
+                repo,
+                host: Some(host),
+            })
+        } else {
+            // Parse owner/repo — reject owner/repo.git shorthand
+            if s.ends_with(".git") {
+                return Err(MuxError::InvalidRepo(format!(
+                    "{s}: use 'owner/repo' not 'owner/repo.git'"
+                )));
+            }
+            let slash = s.find('/').ok_or_else(err)?;
+            let owner = s[..slash].to_ascii_lowercase();
+            let repo = s[slash + 1..].to_ascii_lowercase();
+            if owner.is_empty() || repo.is_empty() || repo.contains('/') {
+                return Err(err());
+            }
+            Ok(RepoRef {
+                owner,
+                repo,
+                host: None,
+            })
+        }
+    }
+}
+
+impl std::fmt::Display for RepoRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.host {
+            Some(h) => write!(f, "git@{}:{}/{}.git", h, self.owner, self.repo),
+            None => write!(f, "{}/{}", self.owner, self.repo),
+        }
+    }
+}
+
 /// Transport mode selected for a host.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -490,5 +620,118 @@ mod tests {
         assert_eq!(Port::try_from(22u16).unwrap().value(), 22);
         assert_eq!(Port::try_from(65535u16).unwrap().value(), 65535);
         assert!(Port::try_from(0u16).is_err());
+    }
+
+    // RepoRef tests
+
+    #[test]
+    fn repo_ref_owner_repo_form() {
+        let r: RepoRef = "mattsp1290/mux".parse().unwrap();
+        assert_eq!(r.owner(), "mattsp1290");
+        assert_eq!(r.repo(), "mux");
+        assert_eq!(r.host(), None);
+        assert_eq!(r.repo_slug(), "mattsp1290/mux");
+        assert_eq!(r.repo_leaf(), "mux");
+    }
+
+    #[test]
+    fn repo_ref_git_url_form() {
+        let r: RepoRef = "git@github.com:mattsp1290/mux.git".parse().unwrap();
+        assert_eq!(r.owner(), "mattsp1290");
+        assert_eq!(r.repo(), "mux");
+        assert_eq!(r.host(), Some("github.com"));
+        assert_eq!(r.repo_slug(), "mattsp1290/mux");
+        assert_eq!(r.clone_url().unwrap(), "git@github.com:mattsp1290/mux.git");
+    }
+
+    #[test]
+    fn repo_ref_rejects_dot_git_shorthand() {
+        assert!("mattsp1290/mux.git".parse::<RepoRef>().is_err());
+    }
+
+    #[test]
+    fn repo_ref_rejects_empty_owner() {
+        assert!("/mux".parse::<RepoRef>().is_err());
+    }
+
+    #[test]
+    fn repo_ref_rejects_empty_repo() {
+        assert!("mattsp1290/".parse::<RepoRef>().is_err());
+    }
+
+    #[test]
+    fn repo_ref_rejects_no_slash() {
+        assert!("mattsp1290".parse::<RepoRef>().is_err());
+    }
+
+    #[test]
+    fn repo_ref_rejects_too_many_slashes() {
+        // org/sub/repo is not a valid two-component owner/repo
+        assert!("org/sub/repo".parse::<RepoRef>().is_err());
+    }
+
+    #[test]
+    fn repo_ref_lowercases_input() {
+        let r: RepoRef = "MyOrg/MyRepo".parse().unwrap();
+        assert_eq!(r.owner(), "myorg");
+        assert_eq!(r.repo(), "myrepo");
+        assert_eq!(r.repo_slug(), "myorg/myrepo");
+    }
+
+    #[test]
+    fn repo_ref_storage_slug_replaces_non_alnum() {
+        let r: RepoRef = "my-org/my_repo".parse().unwrap();
+        // owner has hyphen (ok), repo has underscore → replaced with hyphen
+        assert_eq!(r.storage_slug(), "my-org-my-repo");
+    }
+
+    #[test]
+    fn repo_ref_storage_slug_collapses_hyphens() {
+        let r: RepoRef = "my.org/my.repo".parse().unwrap();
+        // dots → hyphens, no consecutive hyphens
+        assert_eq!(r.storage_slug(), "my-org-my-repo");
+    }
+
+    #[test]
+    fn repo_ref_display_owner_repo_roundtrip() {
+        let s = "mattsp1290/mux";
+        let r: RepoRef = s.parse().unwrap();
+        assert_eq!(r.to_string(), s);
+    }
+
+    #[test]
+    fn repo_ref_display_git_url_roundtrip() {
+        let s = "git@github.com:mattsp1290/mux.git";
+        let r: RepoRef = s.parse().unwrap();
+        assert_eq!(r.to_string(), s);
+    }
+
+    #[test]
+    fn repo_ref_clone_url_for_default_host() {
+        let r: RepoRef = "mattsp1290/mux".parse().unwrap();
+        assert_eq!(
+            r.clone_url_for("github.com"),
+            "git@github.com:mattsp1290/mux.git"
+        );
+    }
+
+    #[test]
+    fn repo_ref_git_url_no_dot_git_is_ok() {
+        // git@ form without trailing .git is accepted (strip_suffix returns original)
+        let r: RepoRef = "git@github.com:mattsp1290/mux".parse().unwrap();
+        assert_eq!(r.owner(), "mattsp1290");
+        assert_eq!(r.repo(), "mux");
+    }
+
+    #[test]
+    fn repo_ref_git_url_rejects_empty_host() {
+        assert!("git@:mattsp1290/mux.git".parse::<RepoRef>().is_err());
+    }
+
+    #[test]
+    fn repo_ref_git_url_rejects_no_colon() {
+        assert!("git@github.com/mattsp1290/mux.git"
+            .parse::<RepoRef>()
+            .is_err());
     }
 }
