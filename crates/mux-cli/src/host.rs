@@ -31,10 +31,14 @@ fn cmd_add(conn: &Connection, alias: String, user_at_addr: String, port: u16) ->
     if user.is_empty() { bail!("user part of user@addr must not be empty"); }
     if addr.is_empty() { bail!("addr part of user@addr must not be empty"); }
 
-    // Tilde expansion: if addr starts with ~, expand to $HOME/<rest>
+    // Tilde expansion: if addr starts with ~, expand to $HOME/<rest>.
+    // Error on empty HOME rather than silently producing a malformed path.
     let addr = if addr.starts_with('~') {
-        let home = std::env::var("HOME").unwrap_or_default();
-        let rest = &addr[1..];
+        let home = std::env::var("HOME")
+            .ok()
+            .filter(|h| !h.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("tilde expansion requires HOME to be set"))?;
+        let rest = addr.strip_prefix('~').unwrap_or("");
         if rest.is_empty() { home } else { format!("{home}{rest}") }
     } else {
         addr.to_owned()
@@ -54,7 +58,7 @@ fn cmd_add(conn: &Connection, alias: String, user_at_addr: String, port: u16) ->
         Err(e) => {
             // Check full error chain (anyhow wraps the SQLite error with context)
             let msg = format!("{e:#}").to_lowercase();
-            if msg.contains("unique constraint failed") || msg.contains("constraint failed") {
+            if msg.contains("unique constraint failed") {
                 bail!("host '{}' already exists", alias.as_str())
             }
             Err(e)
@@ -72,7 +76,7 @@ fn cmd_list(conn: &Connection) -> Result<()> {
 
     let alias_w = hosts.iter().map(|h| h.alias.len()).max().unwrap_or(5).max(5);
     let user_addr_w = hosts.iter().map(|h| format!("{}@{}", h.user, h.addr).len()).max().unwrap_or(12).max("USER@ADDR".len());
-    let port_w = "PORT".len();
+    let port_w = hosts.iter().map(|h| h.port.to_string().len()).max().unwrap_or(4).max("PORT".len());
     let arch_w = "ARCH".len().max(7);
 
     println!(
@@ -110,7 +114,7 @@ async fn cmd_remove(conn: &Connection, alias: String, yes: bool) -> Result<()> {
         std::io::stdin().lock().read_line(&mut line)?;
         let response = line.trim().to_lowercase();
         if response != "y" {
-            println!("Aborted.");
+            eprintln!("Aborted.");
             return Ok(());
         }
     }
