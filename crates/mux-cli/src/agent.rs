@@ -43,7 +43,7 @@ pub fn select_agent_binary(arch: &str) -> Result<(std::path::PathBuf, String)> {
             if !path.exists() {
                 bail!("MUX_AGENT_BINARY path does not exist: {:?}", path);
             }
-            let version = detect_version(&path);
+            let version = version_for_arch(&path, arch);
             return Ok((path, version));
         }
     }
@@ -63,8 +63,20 @@ pub fn select_agent_binary(arch: &str) -> Result<(std::path::PathBuf, String)> {
         );
     }
 
-    let version = detect_version(&path);
+    let version = version_for_arch(&path, arch);
     Ok((path, version))
+}
+
+/// Detect version of the agent binary, but only attempt local execution when
+/// the target `arch` matches the local build target. Cross-arch binaries
+/// cannot be executed locally (e.g. deploying aarch64 from x86_64 gives
+/// `Exec format error`); the fallback is the mux-cli package version.
+fn version_for_arch(binary_path: &std::path::Path, arch: &str) -> String {
+    if is_local_arch(arch) {
+        detect_version(binary_path)
+    } else {
+        env!("CARGO_PKG_VERSION").to_owned()
+    }
 }
 
 /// Run `binary --version` and parse "mux-agent X.Y.Z".
@@ -118,24 +130,33 @@ pub fn parse_lock_pid(json: &str) -> Option<u64> {
 ///
 /// - `sha256sum`:          `<64-hex>  <filename>\n`
 /// - `openssl dgst -sha256`: `SHA256(<filename>)= <64-hex>\n`
+///
+/// Anchored to the known output formats: does NOT accept any arbitrary 64-hex token.
 pub fn parse_sha256_output(output: &str) -> Option<String> {
     for line in output.lines() {
         let line = line.trim();
-        // sha256sum: first whitespace-delimited field is the hash
-        if let Some(first) = line.split_whitespace().next() {
-            if first.len() == 64 && first.chars().all(|c| c.is_ascii_hexdigit()) {
-                return Some(first.to_lowercase());
+        // openssl: line starts with "SHA256(" — parse hash after last "= "
+        if line.starts_with("SHA256(") {
+            if let Some(h) = line.rsplit("= ").next() {
+                if is_sha256_hex(h) {
+                    return Some(h.to_ascii_lowercase());
+                }
             }
+            continue;
         }
-        // openssl: "SHA256(path)= <hash>"
-        if let Some(after_eq) = line.rfind('=').and_then(|i| line.get(i + 1..)) {
-            let hash = after_eq.trim();
-            if hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit()) {
-                return Some(hash.to_lowercase());
+        // sha256sum: first field is the hash, second field is the filename
+        let mut fields = line.split_whitespace();
+        if let (Some(h), Some(_file)) = (fields.next(), fields.next()) {
+            if is_sha256_hex(h) {
+                return Some(h.to_ascii_lowercase());
             }
         }
     }
     None
+}
+
+fn is_sha256_hex(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// Compute the sha256 hex digest of `data`.
@@ -196,7 +217,7 @@ pub fn run_agent_deploy<S: DeployHost>(ctx: DeployContext<'_, S>) -> Result<()> 
 
     // ── 5. Create remote directory ────────────────────────────────────────────
     let (code, _, stderr) = ssh
-        .run(&format!("mkdir -p '{remote_dir}'"))
+        .run(&format!("mkdir -p {}", sh_quote(&remote_dir)))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     if code != 0 {
         bail!(
@@ -214,7 +235,7 @@ pub fn run_agent_deploy<S: DeployHost>(ctx: DeployContext<'_, S>) -> Result<()> 
 
     // ── 8. chmod +x ───────────────────────────────────────────────────────────
     let (code, _, stderr) = ssh
-        .run(&format!("chmod +x '{remote_path}'"))
+        .run(&format!("chmod +x {}", sh_quote(&remote_path)))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     if code != 0 {
         bail!(
@@ -224,6 +245,8 @@ pub fn run_agent_deploy<S: DeployHost>(ctx: DeployContext<'_, S>) -> Result<()> 
     }
 
     // ── 9. Persist version (only after verified upload) ───────────────────────
+    // unwrap_or_default() yields 0 (1970) if the system clock is before the epoch;
+    // acceptable for a local tool — a nonsense deployed_at is visible in logs.
     let deployed_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -239,6 +262,20 @@ pub fn run_agent_deploy<S: DeployHost>(ctx: DeployContext<'_, S>) -> Result<()> 
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
+/// POSIX single-quote escaping: wraps `s` in `'...'` and escapes embedded `'`.
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// True when `arch` (the remote host's arch, e.g. "amd64") matches the local
+/// build target — safe to execute a binary of that arch locally.
+fn is_local_arch(arch: &str) -> bool {
+    let local = std::env::consts::ARCH;
+    arch == local
+        || (arch == "amd64" && local == "x86_64")
+        || (arch == "arm64" && local == "aarch64")
+}
+
 /// Attempt graceful stop of the running agent, if any.
 ///
 /// 1. Read lock file for PID.
@@ -248,15 +285,17 @@ pub fn run_agent_deploy<S: DeployHost>(ctx: DeployContext<'_, S>) -> Result<()> 
 fn stop_agent_if_running<S: RemoteExec>(ssh: &S, lock_path: &str) -> Result<()> {
     // Read lock file (best-effort — missing lock means no agent).
     let (code, stdout, _) = ssh
-        .run(&format!("cat '{lock_path}' 2>/dev/null"))
+        .run(&format!("cat {} 2>/dev/null", sh_quote(lock_path)))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     if code != 0 || stdout.trim().is_empty() {
         return Ok(());
     }
 
+    // Bound the PID to the kernel max; reject obviously bogus values from a
+    // hostile or corrupted remote lock file.
     let pid = match parse_lock_pid(&stdout) {
-        Some(p) if p > 0 => p,
+        Some(p) if (1..=4_194_304).contains(&p) => p,
         _ => return Ok(()),
     };
 
@@ -293,7 +332,7 @@ fn verify_upload<S: RemoteExec>(
 ) -> Result<()> {
     // Size check.
     let (code, stdout, stderr) = ssh
-        .run(&format!("wc -c < '{remote_path}'"))
+        .run(&format!("wc -c < {}", sh_quote(remote_path)))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     if code != 0 {
         bail!(
@@ -314,9 +353,10 @@ fn verify_upload<S: RemoteExec>(
     }
 
     // Hash check — try sha256sum (Linux) then openssl (macOS/BSD).
+    let qp = sh_quote(remote_path);
     let (code, stdout, _) = ssh
         .run(&format!(
-            "sha256sum '{remote_path}' 2>/dev/null || openssl dgst -sha256 '{remote_path}'"
+            "sha256sum {qp} 2>/dev/null || openssl dgst -sha256 {qp}"
         ))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     if code != 0 {
@@ -430,18 +470,30 @@ mod tests {
         host_repo::get_by_id(conn, id).unwrap().unwrap()
     }
 
+    // ── Env guard ─────────────────────────────────────────────────────────────
+
+    /// RAII guard that removes an env var on drop, ensuring tests that set
+    /// `MUX_AGENT_BINARY` don't leak the value to unrelated tests.
+    struct EnvGuard(&'static str);
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            std::env::remove_var(self.0);
+        }
+    }
+
     // ── Fake binary fixture ───────────────────────────────────────────────────
 
     /// Write a small fake binary file and set MUX_AGENT_BINARY to its path.
-    /// Returns (TempDir, content_bytes, sha256_hex).
-    fn setup_fake_binary() -> (TempDir, Vec<u8>, String) {
+    /// Returns (TempDir, content_bytes, sha256_hex, EnvGuard).
+    /// Hold the guard for the duration of the test to ensure cleanup on exit.
+    fn setup_fake_binary() -> (TempDir, Vec<u8>, String, EnvGuard) {
         let dir = TempDir::new().unwrap();
         let content: Vec<u8> = b"fake-mux-agent-binary-content-for-testing".to_vec();
         let path = dir.path().join("mux-agent-fake");
         std::fs::write(&path, &content).unwrap();
         std::env::set_var("MUX_AGENT_BINARY", path.to_str().unwrap());
         let hash = sha256_hex(&content);
-        (dir, content, hash)
+        (dir, content, hash, EnvGuard("MUX_AGENT_BINARY"))
     }
 
     // ── Happy path ────────────────────────────────────────────────────────────
@@ -451,7 +503,7 @@ mod tests {
         let (_store_dir, store) = open_store();
         let conn = store.conn();
         let host = insert_host_with_probe(conn, "prod");
-        let (_bin_dir, content, hash) = setup_fake_binary();
+        let (_bin_dir, content, hash, _guard) = setup_fake_binary();
         let size = content.len().to_string();
         let sha_line = format!("{hash}  /home/user/.mux/bin/mux-agent");
 
@@ -484,7 +536,7 @@ mod tests {
         let (_store_dir, store) = open_store();
         let conn = store.conn();
         let host = insert_host_with_probe(conn, "prod");
-        let (_bin_dir, content, hash) = setup_fake_binary();
+        let (_bin_dir, content, hash, _guard) = setup_fake_binary();
         let size = content.len().to_string();
         let sha_line = format!("{hash}  /home/user/.mux/bin/mux-agent");
 
@@ -547,7 +599,7 @@ mod tests {
         let (_store_dir, store) = open_store();
         let conn = store.conn();
         let host = insert_host_with_probe(conn, "prod");
-        let (_bin_dir, content, _hash) = setup_fake_binary();
+        let (_bin_dir, content, _hash, _guard) = setup_fake_binary();
 
         // Remote reports wrong size.
         let responses = vec![
@@ -571,7 +623,7 @@ mod tests {
         let (_store_dir, store) = open_store();
         let conn = store.conn();
         let host = insert_host_with_probe(conn, "prod");
-        let (_bin_dir, content, _hash) = setup_fake_binary();
+        let (_bin_dir, content, _hash, _guard) = setup_fake_binary();
         let size = content.len().to_string();
 
         // Remote reports wrong hash.
@@ -598,7 +650,7 @@ mod tests {
         let (_store_dir, store) = open_store();
         let conn = store.conn();
         let host = insert_host_with_probe(conn, "prod");
-        let _bin_dir = setup_fake_binary();
+        let (_bin_dir, _content, _hash, _guard) = setup_fake_binary();
 
         let responses = vec![
             (1, "", ""),  // cat lock
@@ -614,6 +666,33 @@ mod tests {
         assert!(av.is_none(), "version must not be persisted on upload failure");
     }
 
+    #[test]
+    fn deploy_chmod_failure_does_not_persist_version() {
+        let (_store_dir, store) = open_store();
+        let conn = store.conn();
+        let host = insert_host_with_probe(conn, "prod");
+        let (_bin_dir, content, hash, _guard) = setup_fake_binary();
+        let size = content.len().to_string();
+        let sha_line = format!("{hash}  /home/user/.mux/bin/mux-agent");
+
+        let responses = vec![
+            (1, "", ""),                // cat lock → no agent
+            (0, "", ""),                // mkdir -p
+            (0, size.as_str(), ""),     // wc -c
+            (0, sha_line.as_str(), ""), // sha256sum
+            (1, "", "permission denied"), // chmod +x → fails
+        ];
+        let ssh = MockDeployHost::new(responses);
+        let err = run_agent_deploy(DeployContext { conn, host: &host, ssh }).unwrap_err();
+        assert!(
+            err.to_string().contains("chmod +x failed"),
+            "expected chmod error, got: {err}"
+        );
+        // Version must NOT be persisted — chmod failure is pre-persist.
+        let av = agent_version_repo::get_for_host(conn, host.id).unwrap();
+        assert!(av.is_none(), "version must not be persisted on chmod +x failure");
+    }
+
     // ── Graceful stop ─────────────────────────────────────────────────────────
 
     #[test]
@@ -621,7 +700,7 @@ mod tests {
         let (_store_dir, store) = open_store();
         let conn = store.conn();
         let host = insert_host_with_probe(conn, "prod");
-        let (_bin_dir, content, hash) = setup_fake_binary();
+        let (_bin_dir, content, hash, _guard) = setup_fake_binary();
         let size = content.len().to_string();
 
         // Agent IS running (pid = 99999, SIGTERM is enough).
@@ -654,7 +733,7 @@ mod tests {
         let (_store_dir, store) = open_store();
         let conn = store.conn();
         let host = insert_host_with_probe(conn, "prod");
-        let (_bin_dir, content, hash) = setup_fake_binary();
+        let (_bin_dir, content, hash, _guard) = setup_fake_binary();
         let size = content.len().to_string();
 
         // No lock file — agent not running.
