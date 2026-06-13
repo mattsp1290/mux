@@ -567,6 +567,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "mux-integration-tests"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+]
+
+[[package]]
 name = "mux-observability-tests"
 version = "0.1.0"
 dependencies = [

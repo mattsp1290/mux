@@ -145,7 +145,8 @@ No gaps.
 | TOFU: read-only ops skip prompt (mark unreachable on mismatch) | ✓ | `crates/mux-ssh/src/trust.rs` |
 | Host key algorithm preference order | ✓ | `crates/mux-ssh/src/trust.rs:20–25` |
 | Transport: streamlocal (preferred) / TCP fallback | ✓ | `crates/mux-ssh/src/transport.rs:18–64` |
-| `MUX_FORCE_TRANSPORT` env var | ✓ | `crates/mux-ssh/src/transport.rs` |
+| `MUX_FORCE_TRANSPORT` parsing | ✓ | `crates/mux-ssh/src/transport.rs` (parse_force_transport, read_force_transport) |
+| `MUX_FORCE_TRANSPORT` honoured in ensure_running | ✗ GAP | `crates/mux-cli/src/agent_start.rs:533–545` (two tests `#[ignore]` with `todo!()`) — transport env var not yet read in the agent-start flow |
 | Transport persisted per session | ✓ | `sessions.transport_mode` in schema |
 | `ssh_agent_not_forwarded` validation before SSH ops | ✗ GAP | Not enforced as a precondition; only detected indirectly at clone time |
 
@@ -207,7 +208,8 @@ No gaps.
 | Status CLI wiring | ✗ **BLOCKED** | `crates/mux-cli/src/lib.rs:183` |
 | Kill: TOFU, ownership, workdir removal | ✓ EXISTS | `crates/mux-cli/src/kill.rs` |
 | Kill CLI wiring | ✗ **BLOCKED** | `crates/mux-cli/src/lib.rs:186` |
-| Attach: selector, dead rejection, TOFU, temp known_hosts, exec ssh | ✓ EXISTS | `crates/mux-cli/src/attach.rs:1–114` |
+| Attach: selector, dead rejection, TOFU, exec ssh | ✓ EXISTS | `crates/mux-cli/src/attach.rs:1–114` |
+| Attach: temp known_hosts written with stored fingerprint (pinned) | ✗ PARTIAL | `attach.rs:104` writes empty file; uses `StrictHostKeyChecking=accept-new` — TOFU verified before exec but not pinned via known_hosts. Documented at `attach.rs:49–53` as an architectural constraint (only fingerprint hash stored, not raw public key blob). |
 | Attach CLI wiring | ✗ **BLOCKED** | `crates/mux-cli/src/lib.rs:179` |
 
 ---
@@ -260,7 +262,10 @@ All CLI commands that require SSH connections return `bail!("SSH execution not y
 | `ssh_agent_not_forwarded` precondition check | Not enforced before SSH ops | docs/01, docs/04 |
 | `tmux_version` not persisted after `host test` | `crates/mux-cli/src/host.rs:332–335` TODO | docs/01 §host-test |
 | Concurrent agent-start safety (O_CREAT\|O_EXCL) | `crates/mux-cli/src/agent_start.rs:507–514` #[ignore] | docs/05 §concurrent-start |
-| RPC client 30s timeout not wired | RPC client (`crates/mux-rpc/src/client.rs`) | docs/05 §rpc-timeouts |
+| ~~RPC client 30s timeout~~ (false gap — already implemented) | `crates/mux-rpc/src/client.rs:20, 85` (`REQUEST_TIMEOUT = 30s`) | docs/05 §rpc-timeouts |
+| Shutdown drain (complete in-flight CreateSession) | Partial — docs/05 is plain v0.1, not "future" | docs/05 §shutdown |
+| `MUX_FORCE_TRANSPORT` not wired in `ensure_running` | Parsed in `transport.rs` but `todo!()` at `agent_start.rs:535,545` | docs/04 §transport |
+| `mux attach` known_hosts empty | Always empty in `attach.rs`; no host-key pinning path to cert store | docs/07 §attach |
 
 ### Deferred (spec says "future")
 
@@ -268,7 +273,6 @@ All CLI commands that require SSH connections return `bail!("SSH execution not y
 |---|---|---|
 | JSON logging for non-TTY | Not implemented | docs/08 ("future") |
 | StreamSessionEvents RPC | Marked unimplemented | docs/05 §stream-session-events |
-| Shutdown drain (complete in-flight CreateSession) | Partial | docs/05 §shutdown |
 
 ---
 
@@ -284,7 +288,11 @@ The following beads are recommended to close the identified gaps:
 
 4. **Implement concurrent-start safety** — `O_CREAT | O_EXCL` advisory lock in `agent_start.rs`; remove the `#[ignore]` test.
 
-5. **Wire RPC client 30s timeout** — add `tokio::time::timeout` around RPC calls in `crates/mux-rpc/src/client.rs`.
+5. ~~**Wire RPC client 30s timeout**~~ — false gap; `REQUEST_TIMEOUT = 30s` is already implemented at `crates/mux-rpc/src/client.rs:20,85`. No bead needed.
+
+6. **Wire `MUX_FORCE_TRANSPORT` in `ensure_running`** — the env var is parsed in `transport.rs` but the `todo!()` stubs at `agent_start.rs:535,545` must be replaced with transport-selection logic.
+
+7. **`mux attach` host-key pinning** — `known_hosts` is always empty; implement cert-store lookup (or document as a v0.1 architectural constraint requiring manual `known_hosts` management).
 
 ---
 
