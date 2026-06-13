@@ -1,0 +1,13 @@
+[package]
+name = "mux-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Shared mux domain types and validation"
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+uuid = { version = "1", features = ["v4", "serde"] }

@@ -17,6 +17,9 @@ bin-release/
 # should NOT be excluded as they contain compiler settings and other important
 # information for Eclipse / Flash Builder.
 
+# Rust build output
+/target/
+
 # Beads / Dolt files (added by bd init)
 .dolt/
 *.db
