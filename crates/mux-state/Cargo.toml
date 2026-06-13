@@ -1,0 +1,16 @@
+[package]
+name = "mux-state"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "mux local SQLite state layer"
+
+[dependencies]
+mux-core = { path = "../mux-core" }
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

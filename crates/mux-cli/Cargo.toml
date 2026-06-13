@@ -1,0 +1,23 @@
+[package]
+name = "mux-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "mux CLI command implementations"
+
+[dependencies]
+mux-core = { path = "../mux-core" }
+mux-state = { path = "../mux-state" }
+mux-ssh = { path = "../mux-ssh" }
+mux-rpc = { path = "../mux-rpc" }
+anyhow.workspace = true
+clap.workspace = true
+clap_complete.workspace = true
+serde.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+assert_cmd.workspace = true
+predicates.workspace = true

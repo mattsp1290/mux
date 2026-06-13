@@ -1,0 +1,20 @@
+[package]
+name = "mux"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "tmux session manager CLI"
+
+[[bin]]
+name = "mux"
+path = "src/main.rs"
+
+[dependencies]
+mux-cli = { path = "../mux-cli" }
+mux-core = { path = "../mux-core" }
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
