@@ -383,9 +383,18 @@ mod tests {
     use std::io::{Read, Write};
     use std::os::unix::net::UnixListener;
 
+    // Serialize all tests that mutate SSH_AUTH_SOCK so they don't race under
+    // cargo's default parallel test runner.
+    static SSH_AUTH_SOCK_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
+        std::sync::OnceLock::new();
+    fn ssh_auth_sock_guard() -> std::sync::MutexGuard<'static, ()> {
+        SSH_AUTH_SOCK_LOCK.get_or_init(|| std::sync::Mutex::new(())).lock().unwrap()
+    }
+
     /// Binds a Unix socket at `path` and spawns a background thread that accepts
-    /// one connection, drains the request, and writes `response`. The socket is
-    /// bound before this function returns.
+    /// one connection, drains the request (discarded), and writes `response`. The
+    /// socket is bound before this function returns so the caller can connect
+    /// immediately.
     fn spawn_agent_responder(path: &std::path::Path, response: Vec<u8>) {
         let listener = UnixListener::bind(path).unwrap();
         std::thread::spawn(move || {
@@ -438,6 +447,7 @@ mod tests {
 
     #[test]
     fn list_agent_keys_unconnectable_socket() {
+        let _g = ssh_auth_sock_guard();
         // Point SSH_AUTH_SOCK to a nonexistent path so the connect fails.
         std::env::set_var("SSH_AUTH_SOCK", "/nonexistent/path/agent.sock");
         let result = list_agent_keys();
@@ -449,6 +459,7 @@ mod tests {
 
     #[test]
     fn list_agent_keys_no_auth_sock_env_returns_not_forwarded() {
+        let _g = ssh_auth_sock_guard();
         std::env::remove_var("SSH_AUTH_SOCK");
         let result = list_agent_keys();
         assert!(
@@ -459,6 +470,7 @@ mod tests {
 
     #[test]
     fn list_agent_keys_agent_returns_failure() {
+        let _g = ssh_auth_sock_guard();
         let dir = TempDir::new().unwrap();
         let sock = dir.path().join("agent-fail.sock");
         spawn_agent_responder(&sock, agent_failure_frame());
@@ -472,6 +484,7 @@ mod tests {
 
     #[test]
     fn list_agent_keys_oversized_reply_returns_not_forwarded() {
+        let _g = ssh_auth_sock_guard();
         let dir = TempDir::new().unwrap();
         let sock = dir.path().join("agent-oversized.sock");
         spawn_agent_responder(&sock, agent_oversized_len_frame());
@@ -485,6 +498,7 @@ mod tests {
 
     #[test]
     fn list_agent_keys_valid_reply_returns_keys() {
+        let _g = ssh_auth_sock_guard();
         let dir = TempDir::new().unwrap();
         let sock = dir.path().join("agent-ok.sock");
         spawn_agent_responder(&sock, agent_one_ed25519_key_frame());
@@ -493,6 +507,7 @@ mod tests {
         assert_eq!(result.len(), 1, "expected exactly one key");
         assert_eq!(result[0].algorithm, "ssh-ed25519");
         assert_eq!(result[0].comment, "test-key");
-        assert!(!result[0].key_blob.is_empty());
+        // key blob: 4-byte len(11) + "ssh-ed25519" + 4-byte len(32) + 32 zero bytes = 51
+        assert_eq!(result[0].key_blob.len(), 51);
     }
 }
