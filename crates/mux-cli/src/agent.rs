@@ -1170,6 +1170,11 @@ mod tests {
     }
 
     // ── select_agent_binary ───────────────────────────────────────────────────
+    //
+    // The adjacent-binary success path (current_exe() + "mux-agent-{arch}") is not
+    // unit-testable: current_exe() resolves to the test runner binary, not mux.
+    // That path is covered by integration tests (mux-zpx). Unit tests here cover
+    // the MUX_AGENT_BINARY env-var path and the adjacent-lookup error paths.
 
     #[test]
     fn select_agent_binary_env_var_existing_path_succeeds() {
@@ -1248,6 +1253,13 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("fake-mux-agent");
         std::fs::write(&path, b"not-a-real-binary").unwrap();
+        // Explicitly remove the execute bit so Command::output() returns Err(EACCES),
+        // not just a non-ELF format error, making the precondition unambiguous.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
         let version = detect_version(&path);
         assert_eq!(
             version,
@@ -1276,18 +1288,19 @@ mod tests {
                 assert!(!is_local_arch("x86_64"), "x86_64 should not be local on aarch64");
             }
             _ => {
-                // Unknown host arch: just verify the function doesn't panic
-                let _ = is_local_arch("amd64");
-                let _ = is_local_arch("arm64");
+                // Unknown host arch (e.g. RISC-V): verify neither mux arch is local
+                // and the function doesn't panic.
+                assert!(!is_local_arch("amd64"), "amd64 should not match {local}");
+                assert!(!is_local_arch("arm64"), "arm64 should not match {local}");
             }
         }
     }
 
     #[test]
-    fn is_local_arch_cross_arch_binary_uses_package_version() {
-        // When deploying a cross-arch binary, version_for_arch falls back to
-        // CARGO_PKG_VERSION rather than trying to execute the binary (which would
-        // fail with "Exec format error" on incompatible architectures).
+    fn version_for_arch_cross_arch_uses_package_version() {
+        // version_for_arch skips binary execution for non-local arches and returns
+        // CARGO_PKG_VERSION directly. The binary content is irrelevant — the
+        // is_local_arch check short-circuits before any Command::output() call.
         let dir = TempDir::new().unwrap();
         let fake_path = dir.path().join("mux-agent-fake");
         std::fs::write(&fake_path, b"cross-arch-binary").unwrap();
