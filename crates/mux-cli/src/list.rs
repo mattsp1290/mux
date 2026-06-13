@@ -6,6 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 use rusqlite::Connection;
 
+#[cfg(test)]
 use mux_core::error::MuxError;
 use mux_rpc::client::RpcClient;
 use mux_rpc::schema::{SessionInfo, SessionStatusValue};
@@ -40,8 +41,8 @@ where
 {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
 
     let hosts = host_repo::list(ctx.conn)?;
 
@@ -64,8 +65,14 @@ where
     F: Fn(&Host) -> E,
     E: RemoteExec,
 {
-    // Load non-dead sessions with a real tmux_name (list_for_host already filters tmux_name IS NOT NULL).
-    let sessions: Vec<_> = session_repo::list_for_host(conn, host.id)?
+    // Load ALL rows for this host (list_for_host filters tmux_name IS NOT NULL).
+    // Two views are derived:
+    //   - `all_uuids`: UUID set including dead rows — used as the import guard so a
+    //     dead session's UUID is never re-imported (plain INSERT would hit UNIQUE).
+    //   - `sessions`: non-dead rows only — used for the reconciliation state machine.
+    let all_sessions = session_repo::list_for_host(conn, host.id)?;
+    let all_uuids: HashSet<String> = all_sessions.iter().map(|s| s.uuid.clone()).collect();
+    let sessions: Vec<_> = all_sessions
         .into_iter()
         .filter(|s| s.status != "dead")
         .collect();
@@ -74,6 +81,10 @@ where
     // live sessions to import (docs/07 rule 1: import unknown live sessions).
     let live_sessions = probe_agent(host, make_exec).await;
 
+    // TODO (needs-manual): wrap per-host writes in BEGIN/COMMIT so a mid-host write
+    // failure leaves no partial reconciliation state. Currently a write error aborts
+    // all remaining hosts without rollback. Either transactional or best-effort
+    // (log + continue to next host) would be an improvement.
     match live_sessions {
         None => {
             // Host unreachable: mark all `active` sessions as `unreachable`; leave others.
@@ -84,7 +95,7 @@ where
             }
         }
         Some(live) => {
-            apply_reconciliation(conn, host, &sessions, live, now)?;
+            apply_reconciliation(conn, host, &sessions, &all_uuids, live, now)?;
         }
     }
 
@@ -103,13 +114,20 @@ where
 
     let urls = match starter.probe_existing() {
         Ok(Some(u)) => u,
-        _ => return None,
+        Ok(None) => return None,
+        Err(e) => {
+            eprintln!("mux: agent probe error on host '{}': {e}", host.alias);
+            return None;
+        }
     };
 
     let rpc = RpcClient::tcp("127.0.0.1", urls.tcp_port());
     let resp = match rpc.list_sessions().await {
         Ok(r) => r,
-        Err(_) => return None,
+        Err(e) => {
+            eprintln!("mux: ListSessions RPC failed on host '{}': {e}", host.alias);
+            return None;
+        }
     };
 
     // Filter to mux-prefixed sessions; these are the only ones we manage.
@@ -125,6 +143,7 @@ fn apply_reconciliation(
     conn: &Connection,
     host: &Host,
     sessions: &[mux_state::model::Session],
+    all_uuids: &HashSet<String>,
     live: Vec<SessionInfo>,
     now: i64,
 ) -> Result<()> {
@@ -132,8 +151,8 @@ fn apply_reconciliation(
     let agent_by_uuid: HashMap<&str, &SessionInfo> =
         live.iter().map(|s| (s.uuid.as_str(), s)).collect();
 
-    // Collect DB UUIDs so we can detect imports.
-    let db_uuids: HashSet<&str> = sessions.iter().map(|s| s.uuid.as_str()).collect();
+    // `all_uuids` covers ALL DB rows for this host (including dead) so importing a
+    // dead session UUID (which would fail the UNIQUE constraint) is prevented.
 
     // ── Reconcile DB sessions ─────────────────────────────────────────────────
 
@@ -145,6 +164,11 @@ fn apply_reconciliation(
 
         if let Some(info) = agent_by_uuid.get(s.uuid.as_str()) {
             // UUID found in agent list → sync status (also handles resurrection).
+            // NOTE (needs-manual): docs/07 specifies sync-to-active and unreachable→active
+            // resurrection; it does not explicitly ask list to drive rows to terminal `dead`
+            // or `orphaned` based on an agent report. Currently we sync unconditionally; if
+            // an agent transiently reports `dead`, the row becomes permanently invisible.
+            // Decide whether to restrict sync to non-terminal transitions.
             let new_status = agent_status_str(&info.status);
             if s.status != new_status {
                 session_repo::set_status(conn, &s.uuid, new_status, now)?;
@@ -159,6 +183,9 @@ fn apply_reconciliation(
 
             if has_mux_prefix {
                 // docs/07: mux- session the agent no longer recognises → orphaned.
+                // NOTE (needs-manual): this is a one-way door — orphaned rows are never
+                // resurfaced (see skip above). If transient agent absence is possible,
+                // consider `unreachable` (recoverable) here instead; confirm with spec owner.
                 session_repo::set_status(conn, &s.uuid, "orphaned", now)?;
             } else if s.status == "active" {
                 // Non-mux session missing from agent; mark unreachable.
@@ -170,16 +197,19 @@ fn apply_reconciliation(
     // ── Import unknown live sessions ──────────────────────────────────────────
 
     for info in &live {
-        if db_uuids.contains(info.uuid.as_str()) {
-            continue; // already reconciled above
+        if all_uuids.contains(&info.uuid) {
+            continue; // in DB (including dead rows — do not resurface)
         }
 
         // docs/07: live in agent with mux- prefix, UUID not in DB → import as active.
         let shortname = info
             .tmux_name
             .strip_prefix("mux-")
+            .filter(|s| !s.is_empty())
             .unwrap_or(&info.shortname);
 
+        // TODO: imported sessions have empty repo_slug/branch; the kill flow will
+        // need to handle these gracefully when checking session ownership (docs/07 §Kill).
         session_repo::import_session(
             conn,
             &ImportParams {
@@ -227,6 +257,8 @@ fn display_all(conn: &Connection, hosts: &[Host], plain: bool) -> Result<()> {
         any = true;
 
         if plain {
+            // Stable tab-separated contract (do not reorder without a version bump):
+            // host_alias \t shortname \t uuid \t status \t tmux_name \t workdir
             for s in &sessions {
                 println!(
                     "{}\t{}\t{}\t{}\t{}\t{}",
@@ -670,5 +702,31 @@ mod tests {
         // Session must NOT be imported (no mux- prefix → filtered out)
         let s = session_repo::get_by_uuid(conn, non_mux_uuid).unwrap();
         assert!(s.is_none(), "non-mux-prefixed agent session must not be imported");
+    }
+
+    #[tokio::test]
+    async fn list_dead_uuid_in_agent_does_not_crash_and_stays_dead() {
+        // Regression: agent reports a UUID that exists in DB as `dead`.
+        // Previously this could hit the UNIQUE constraint in import_session and
+        // abort the entire mux list run. The row must stay dead; no duplicate created.
+        let (_dir, store) = open_store();
+        let conn = store.conn();
+        let host_id = insert_host(conn);
+        let dead_uuid = "66666666-6666-6666-6666-666666666666";
+        insert_active_session(conn, host_id, dead_uuid, "deadapp2");
+        session_repo::set_status(conn, dead_uuid, "dead", 2_000_000).unwrap();
+
+        let agent_resp = vec![make_session_info(dead_uuid, "deadapp2", SessionStatusValue::Active)];
+        let port = spawn_list_server(encode_list_response(agent_resp)).await;
+        run_list(make_ctx(
+            conn,
+            move |_| MockExec::new(agent_running_responses(port)),
+            false,
+        ))
+        .await
+        .unwrap(); // must not crash with UNIQUE violation
+
+        let s = session_repo::get_by_uuid(conn, dead_uuid).unwrap().unwrap();
+        assert_eq!(s.status, "dead", "dead session must stay dead even if agent reports it");
     }
 }
