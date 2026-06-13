@@ -92,6 +92,10 @@ pub enum MuxError {
     ShortnameExhausted,
 
     // ── Create-flow: host errors (exit code 1) ───────────────────────────────
+    /// Host has no `arch` or `home` set — run `mux host test <alias>` first.
+    #[error("host '{alias}' is not configured: run `mux host test {alias}` first")]
+    HostNotConfigured { alias: String },
+
     /// SSH host key does not match the stored TOFU key.
     /// Hint: "Use `mux host trust <alias>` to review and rotate the key."
     #[error("host key mismatch — TOFU verification failed")]
@@ -164,6 +168,9 @@ impl MuxError {
     /// Returns a user-actionable hint for errors that require user intervention.
     pub fn hint(&self) -> Option<&'static str> {
         match self {
+            MuxError::HostNotConfigured { .. } => {
+                Some("Run `mux host test <alias>` to configure the host.")
+            }
             MuxError::WorkdirPreExisting(_) => {
                 Some("Remove the existing directory or use a different host.")
             }
@@ -196,6 +203,7 @@ impl MuxError {
     /// Callers must use `err.category()` rather than ad-hoc string literals.
     pub fn category(&self) -> &'static str {
         match self {
+            MuxError::HostNotConfigured { .. } => "host_not_configured",
             MuxError::WorkdirPreExisting(_) => "workdir_pre_existing",
             MuxError::GitCloneFailed { .. } => "git_clone_failed",
             MuxError::SshAgentNotForwarded => "ssh_agent_not_forwarded",
@@ -225,6 +233,7 @@ impl MuxError {
             | MuxError::InvalidRepo(_)
             | MuxError::InvalidSessionStatus(_)
             | MuxError::HomeDirNotFound
+            | MuxError::HostNotConfigured { .. }
             | MuxError::WorkdirPreExisting(_)
             | MuxError::SessionAlreadyExists { .. }
             | MuxError::ShortnameExhausted

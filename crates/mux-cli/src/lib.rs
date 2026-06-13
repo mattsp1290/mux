@@ -5,6 +5,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::generate;
 
 pub mod agent_start;
+pub mod create;
 pub mod host;
 pub mod mux_home;
 
@@ -35,7 +36,16 @@ pub enum Command {
         action: AgentAction,
     },
     /// Create a new session
-    Create,
+    Create {
+        /// Repository (owner/repo or git@host:path.git)
+        repo: String,
+        /// Remote host alias
+        #[arg(long)]
+        host: String,
+        /// Branch to check out (defaults to main)
+        #[arg(long)]
+        branch: Option<String>,
+    },
     /// Attach to an existing session
     Attach,
     /// List sessions
@@ -112,7 +122,9 @@ pub async fn run(command: Command, mux_home: PathBuf) -> Result<()> {
             crate::host::run_host(action, store.conn()).await
         }
         Command::Agent { .. } => todo!("mux agent"),
-        Command::Create => todo!("mux create"),
+        // TODO: wire to run_create once a real SshHost SSH impl lands (currently
+        // no production SSH executor exists; the create module is tested in isolation).
+        Command::Create { .. } => anyhow::bail!("mux create: SSH execution not yet implemented"),
         Command::Attach => todo!("mux attach"),
         Command::List => todo!("mux list"),
         Command::Status => todo!("mux status"),
