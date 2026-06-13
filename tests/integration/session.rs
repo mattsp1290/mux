@@ -186,3 +186,41 @@ fn create_force_transport_streamlocal_when_unavailable_exits() {
     let _host = TestHost::start("mux-test-host-a");
     todo!("implement: remove agent socket, MUX_FORCE_TRANSPORT=streamlocal mux create → assert exit 1")
 }
+
+/// Streamlocal transport succeeds when the agent socket is present.
+///
+/// Exercises the happy path of transport selection: agent running with Unix
+/// socket, `mux create` defaults to streamlocal, session is created.
+/// Acceptance: `mux list` shows status=active and transport_mode=streamlocal.
+#[test]
+#[ignore = "requires Docker + running mux-agent (mux-qz4 implementation)"]
+fn create_streamlocal_success_when_agent_socket_present() {
+    crate::require_docker!();
+    let _host = TestHost::start("mux-test-host-a");
+    todo!("implement: deploy agent, wait for socket at ~/.mux/agent.sock, mux create → assert session active + transport=streamlocal")
+}
+
+/// Orphaned session appears in `mux list` with status=orphaned.
+///
+/// An orphaned session is one whose tmux session was killed externally (not via
+/// `mux kill`) while the mux-agent is still reachable. `mux list` reconciliation
+/// detects the tmux session is gone and marks it orphaned.
+#[test]
+#[ignore = "requires Docker + running mux-agent (mux-qz4 implementation)"]
+fn list_orphaned_session_shows_orphaned_status() {
+    crate::require_docker!();
+    let _host = TestHost::start("mux-test-host-a");
+    todo!("implement: create session, SSH into container and kill the tmux session directly (tmux kill-session), run mux list → assert status contains 'orphaned'")
+}
+
+/// `mux attach` on a TCP-transport session uses TCP (not streamlocal probe).
+///
+/// The transport is persisted on create; attach must read and pin it, not
+/// re-probe. Exercises the stored `transport_mode` read path in attach.
+#[test]
+#[ignore = "requires Docker + running mux-agent (mux-qz4 implementation)"]
+fn attach_pinned_to_persisted_transport_mode() {
+    crate::require_docker!();
+    let _host = TestHost::start("mux-test-host-a");
+    todo!("implement: MUX_FORCE_TRANSPORT=tcp mux create, remove agent socket, mux attach → assert attach succeeds without streamlocal probe")
+}

@@ -50,19 +50,23 @@ fn init_is_idempotent() {
     assert_eq!(code2, 0, "second mux init must exit 0 (idempotent); stderr: {stderr2}");
 }
 
-/// State directory has restrictive permissions (mode 0700, owner-only).
+/// State directory is created with restrictive permissions (mode 0700, owner-only).
+///
+/// Uses a non-existent subdirectory so mux init creates it from scratch — this
+/// ensures we test the create-and-chmod path, not TempDir's default of 0700.
 #[cfg(unix)]
 #[test]
 fn init_state_directory_has_restrictive_permissions() {
     use std::os::unix::fs::PermissionsExt;
     let env = TestEnv::new();
-    let mux_home = env.mux_home_str();
+    // Use a non-existent subdirectory so mux init creates it (not TempDir's default).
+    let mux_home = env.mux_home.path().join("state");
+    let mux_home_str = mux_home.to_string_lossy().to_string();
 
-    let (code, _stdout, stderr) = run_mux(&["init"], &[("MUX_HOME", &mux_home)]);
+    let (code, _stdout, stderr) = run_mux(&["init"], &[("MUX_HOME", &mux_home_str)]);
     assert_eq!(code, 0, "mux init must exit 0; stderr: {stderr}");
 
-    let meta = std::fs::metadata(env.mux_home.path())
-        .expect("MUX_HOME dir must exist after init");
+    let meta = std::fs::metadata(&mux_home).expect("MUX_HOME dir must exist after init");
     let mode = meta.permissions().mode() & 0o777;
-    assert_eq!(mode, 0o700, "MUX_HOME must have mode 0700, got {mode:o}");
+    assert_eq!(mode, 0o700, "mux init must create MUX_HOME with mode 0700, got {mode:o}");
 }

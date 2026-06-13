@@ -17,4 +17,3 @@ required-features = ["integration-tests"]
 
 [dev-dependencies]
 tempfile.workspace = true
-rusqlite.workspace = true

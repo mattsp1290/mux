@@ -40,10 +40,17 @@ impl TestEnv {
 /// Resolve the path to the `mux` binary.
 ///
 /// Priority order:
-/// 1. `MUX_BIN` env var (CI override)
-/// 2. `CARGO_BIN_EXE_mux` (set by Cargo for same-package integration tests)
-/// 3. `<workspace_root>/target/debug/mux` or `target/release/mux`
-/// 4. `mux` in PATH (last resort)
+/// 1. `MUX_BIN` env var — recommended for CI; set this to the pre-built binary path.
+/// 2. `CARGO_BIN_EXE_mux` — Cargo sets this only for tests in the *same package* as
+///    the binary; since `mux-integration-tests` is a separate crate this is always
+///    `None` here and the branch never fires. It is kept for documentation purposes.
+/// 3. `<workspace_root>/target/{debug|release}/mux` — normal fallback for local
+///    development after `cargo build -p mux`.
+/// 4. `"mux"` in PATH — last resort. If the binary is not found, the test panics at
+///    invocation with "failed to run mux: No such file or directory".
+///
+/// In CI, always set `MUX_BIN=$(cargo build -p mux --message-format=json | ...)` or
+/// run `cargo build -p mux` before the integration test step.
 pub fn mux_bin_path() -> String {
     if let Ok(bin) = std::env::var("MUX_BIN") {
         return bin;
