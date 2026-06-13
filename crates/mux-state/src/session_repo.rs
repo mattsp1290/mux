@@ -194,7 +194,7 @@ pub fn set_status(conn: &Connection, uuid: &str, status: &str, updated_at: i64) 
 /// Returns the new row id.
 pub fn import_session(conn: &Connection, p: &ImportParams<'_>) -> Result<i64> {
     conn.execute(
-        "INSERT INTO sessions \
+        "INSERT OR IGNORE INTO sessions \
          (uuid, host_id, shortname, tmux_name, repo_slug, branch, \
           workdir, transport_mode, status, imported, created_at, updated_at) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'active', 1, ?9, ?10)",
