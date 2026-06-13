@@ -15,10 +15,15 @@ fn map_agent_version(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentVersion> 
 }
 
 /// Upsert an agent version record (one record per host — UNIQUE(host_id)).
+///
+/// Uses `ON CONFLICT DO UPDATE` to keep the row id stable.
 pub fn upsert(conn: &Connection, host_id: i64, version: &str, deployed_at: i64) -> Result<()> {
     conn.execute(
-        "INSERT OR REPLACE INTO agent_versions (host_id, version, deployed_at) \
-         VALUES (?1, ?2, ?3)",
+        "INSERT INTO agent_versions (host_id, version, deployed_at) \
+         VALUES (?1, ?2, ?3) \
+         ON CONFLICT(host_id) DO UPDATE SET \
+             version     = excluded.version, \
+             deployed_at = excluded.deployed_at",
         params![host_id, version, deployed_at],
     )
     .context("upsert agent version")?;

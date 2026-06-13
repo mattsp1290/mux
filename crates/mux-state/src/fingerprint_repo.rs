@@ -15,7 +15,10 @@ fn map_fingerprint(row: &rusqlite::Row<'_>) -> rusqlite::Result<KnownHostFingerp
     })
 }
 
-/// Upsert a fingerprint record (insert or replace on host_id + algorithm).
+/// Upsert a fingerprint record (insert or update on host_id + algorithm conflict).
+///
+/// Uses `ON CONFLICT DO UPDATE` to keep the existing row id stable and avoid
+/// triggering the DELETE half of any future CASCADE that references this table.
 pub fn upsert(
     conn: &Connection,
     host_id: i64,
@@ -24,8 +27,11 @@ pub fn upsert(
     trusted_at: i64,
 ) -> Result<()> {
     conn.execute(
-        "INSERT OR REPLACE INTO known_host_fingerprints \
-         (host_id, algorithm, fingerprint, trusted_at) VALUES (?1, ?2, ?3, ?4)",
+        "INSERT INTO known_host_fingerprints \
+         (host_id, algorithm, fingerprint, trusted_at) VALUES (?1, ?2, ?3, ?4) \
+         ON CONFLICT(host_id, algorithm) DO UPDATE SET \
+             fingerprint = excluded.fingerprint, \
+             trusted_at  = excluded.trusted_at",
         params![host_id, algorithm, fingerprint, trusted_at],
     )
     .context("upsert known host fingerprint")?;

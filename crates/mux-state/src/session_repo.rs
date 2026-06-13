@@ -75,6 +75,10 @@ pub fn reserve(conn: &Connection, p: &ReserveParams<'_>) -> Result<i64> {
 /// Promote a reservation to a live session by filling in tmux_name, workdir,
 /// transport_mode, and updated_at.  Only matches rows where tmux_name is still
 /// NULL (guards against double-activation).
+///
+/// Returns `true` if a row was updated, `false` if the guard blocked (uuid not
+/// found or already activated).  Callers performing create-flow rollback must
+/// check this to detect a racing activation.
 pub fn activate(
     conn: &Connection,
     uuid: &str,
@@ -82,25 +86,30 @@ pub fn activate(
     workdir: &str,
     transport_mode: &str,
     updated_at: i64,
-) -> Result<()> {
-    conn.execute(
-        "UPDATE sessions \
-         SET tmux_name = ?1, workdir = ?2, transport_mode = ?3, updated_at = ?4 \
-         WHERE uuid = ?5 AND tmux_name IS NULL",
-        params![tmux_name, workdir, transport_mode, updated_at, uuid],
-    )
-    .context("activate session")?;
-    Ok(())
+) -> Result<bool> {
+    let rows = conn
+        .execute(
+            "UPDATE sessions \
+             SET tmux_name = ?1, workdir = ?2, transport_mode = ?3, updated_at = ?4 \
+             WHERE uuid = ?5 AND tmux_name IS NULL",
+            params![tmux_name, workdir, transport_mode, updated_at, uuid],
+        )
+        .context("activate session")?;
+    Ok(rows > 0)
 }
 
 /// Remove a reservation that was never activated (tmux_name still NULL).
-pub fn cancel_reservation(conn: &Connection, uuid: &str) -> Result<()> {
-    conn.execute(
-        "DELETE FROM sessions WHERE uuid = ?1 AND tmux_name IS NULL",
-        params![uuid],
-    )
-    .context("cancel session reservation")?;
-    Ok(())
+///
+/// Returns `true` if a row was deleted, `false` if no matching in-flight row
+/// was found (already activated or uuid unknown).
+pub fn cancel_reservation(conn: &Connection, uuid: &str) -> Result<bool> {
+    let rows = conn
+        .execute(
+            "DELETE FROM sessions WHERE uuid = ?1 AND tmux_name IS NULL",
+            params![uuid],
+        )
+        .context("cancel session reservation")?;
+    Ok(rows > 0)
 }
 
 /// Fetch a session by its UUID.
@@ -132,13 +141,13 @@ pub fn get_by_shortname(
     .context("get session by shortname")
 }
 
-/// List activated sessions for a host, newest first.
+/// List activated sessions for a host, oldest first (docs/07 §List flow step 4).
 pub fn list_for_host(conn: &Connection, host_id: i64) -> Result<Vec<Session>> {
     let mut stmt = conn
         .prepare(&format!(
             "SELECT {SESSION_COLUMNS} FROM sessions \
              WHERE host_id = ?1 AND tmux_name IS NOT NULL \
-             ORDER BY created_at DESC"
+             ORDER BY created_at ASC"
         ))
         .context("prepare list sessions")?;
     let rows = stmt
@@ -240,7 +249,7 @@ mod tests {
         let conn = store.conn();
         let host_id = insert_host(conn);
         reserve(conn, &make_reserve("uuid-2", host_id)).unwrap();
-        activate(
+        let activated = activate(
             conn,
             "uuid-2",
             "mux-myapp",
@@ -249,6 +258,7 @@ mod tests {
             2_000_000,
         )
         .unwrap();
+        assert!(activated, "first activation should succeed");
         let s = get_by_uuid(conn, "uuid-2").unwrap().expect("should exist");
         assert_eq!(s.tmux_name.as_deref(), Some("mux-myapp"));
         assert_eq!(s.workdir.as_deref(), Some("/home/user/repo"));
@@ -262,7 +272,8 @@ mod tests {
         let conn = store.conn();
         let host_id = insert_host(conn);
         reserve(conn, &make_reserve("uuid-3", host_id)).unwrap();
-        cancel_reservation(conn, "uuid-3").unwrap();
+        let removed = cancel_reservation(conn, "uuid-3").unwrap();
+        assert!(removed, "reservation should have been removed");
         let s = get_by_uuid(conn, "uuid-3").unwrap();
         assert!(s.is_none());
     }
@@ -273,9 +284,10 @@ mod tests {
         let conn = store.conn();
         let host_id = insert_host(conn);
         reserve(conn, &make_reserve("uuid-4", host_id)).unwrap();
-        activate(conn, "uuid-4", "mux-first", "/work", "tcp", 2_000_000).unwrap();
-        // Second activate should not panic or error — just affects 0 rows.
-        activate(
+        let first = activate(conn, "uuid-4", "mux-first", "/work", "tcp", 2_000_000).unwrap();
+        assert!(first, "first activation should succeed");
+        // Second activate: guard (tmux_name IS NULL) blocks — returns false, no panic.
+        let second = activate(
             conn,
             "uuid-4",
             "mux-second",
@@ -284,6 +296,7 @@ mod tests {
             3_000_000,
         )
         .unwrap();
+        assert!(!second, "double-activation guard should block");
         let s = get_by_uuid(conn, "uuid-4").unwrap().unwrap();
         assert_eq!(s.tmux_name.as_deref(), Some("mux-first"));
     }
@@ -393,8 +406,36 @@ mod tests {
 
         let sessions = list_for_host(conn, host_id).unwrap();
         assert_eq!(sessions.len(), 2);
-        // Newest first
-        assert_eq!(sessions[0].uuid, "uuid-b");
-        assert_eq!(sessions[1].uuid, "uuid-a");
+        // Oldest first (created_at ASC per docs/07 §List flow step 4)
+        assert_eq!(sessions[0].uuid, "uuid-a");
+        assert_eq!(sessions[1].uuid, "uuid-b");
+    }
+
+    #[test]
+    fn reserve_duplicate_uuid_fails() {
+        let (_dir, store) = open_store();
+        let conn = store.conn();
+        let host_id = insert_host(conn);
+        reserve(conn, &make_reserve("dup-uuid", host_id)).unwrap();
+        let result = reserve(conn, &make_reserve("dup-uuid", host_id));
+        assert!(
+            result.is_err(),
+            "duplicate uuid should be rejected by UNIQUE constraint"
+        );
+    }
+
+    #[test]
+    fn cascade_delete_host_removes_sessions() {
+        let (_dir, store) = open_store();
+        let conn = store.conn();
+        let host_id =
+            crate::host_repo::insert(conn, "cascade-host", "u", "1.2.3.4", 22, 1_000_000).unwrap();
+        reserve(conn, &make_reserve("cascade-uuid", host_id)).unwrap();
+        crate::host_repo::delete(conn, host_id).unwrap();
+        let s = get_by_uuid(conn, "cascade-uuid").unwrap();
+        assert!(
+            s.is_none(),
+            "session should be removed by FK ON DELETE CASCADE"
+        );
     }
 }
