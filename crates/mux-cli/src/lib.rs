@@ -122,6 +122,9 @@ pub enum AgentAction {
     Logs {
         /// Host alias
         alias: String,
+        /// Follow log output (tail -f semantics)
+        #[arg(long, short = 'f')]
+        follow: bool,
     },
     /// Stop the agent on a host
     Stop {
@@ -159,9 +162,13 @@ pub async fn run(command: Command, mux_home: PathBuf) -> Result<()> {
                     let _ = alias;
                     anyhow::bail!("mux agent deploy: SSH execution not yet implemented")
                 }
-                AgentAction::Logs { alias } | AgentAction::Stop { alias } => {
+                AgentAction::Logs { alias, follow } => {
+                    let _ = (store, alias, follow);
+                    anyhow::bail!("mux agent logs: SSH execution not yet implemented")
+                }
+                AgentAction::Stop { alias } => {
                     let _ = (store, alias);
-                    anyhow::bail!("mux agent: SSH execution not yet implemented")
+                    anyhow::bail!("mux agent stop: SSH execution not yet implemented")
                 }
             }
         }
