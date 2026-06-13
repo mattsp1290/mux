@@ -84,8 +84,8 @@ fn cmd_list(conn: &Connection) -> Result<()> {
     let arch_w = "ARCH".len().max(7);
 
     println!(
-        "{:<alias_w$}  {:<user_addr_w$}  {:<port_w$}  {:<arch_w$}  {}",
-        "ALIAS", "USER@ADDR", "PORT", "ARCH", "HOME"
+        "{:<alias_w$}  {:<user_addr_w$}  {:<port_w$}  {:<arch_w$}  HOME",
+        "ALIAS", "USER@ADDR", "PORT", "ARCH"
     );
 
     for host in &hosts {
@@ -722,6 +722,30 @@ mod tests {
         let fp = mux_state::fingerprint_repo::get(conn, host.id, "ssh-ed25519")
             .unwrap().unwrap();
         assert_eq!(fp.fingerprint, "SHA256:AAAA");
+    }
+
+    // ── parse_preflight_output edge cases ─────────────────────────────────────
+
+    #[test]
+    fn parse_preflight_output_no_start_sentinel_errors() {
+        let output = "x86_64\n/home/user\ntmux 3.3a\nMUX_SENTINEL_V1_END\n";
+        let err = parse_preflight_output(output).unwrap_err();
+        assert!(err.to_string().contains("missing start sentinel"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_preflight_output_no_end_sentinel_errors() {
+        let output = "Welcome!\nMUX_SENTINEL_V1\nx86_64\n/home/user\ntmux 3.3a\n";
+        let err = parse_preflight_output(output).unwrap_err();
+        assert!(err.to_string().contains("missing end sentinel"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_preflight_output_too_few_inner_lines_errors() {
+        // Only 2 lines between sentinels (need 3)
+        let output = "MUX_SENTINEL_V1\nx86_64\n/home/user\nMUX_SENTINEL_V1_END\n";
+        let err = parse_preflight_output(output).unwrap_err();
+        assert!(err.to_string().contains("expected 3 lines"), "got: {err}");
     }
 
     /// Mismatch with no stdin → read_yes_no reads empty line → rotation declined.

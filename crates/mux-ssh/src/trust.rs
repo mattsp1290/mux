@@ -344,10 +344,110 @@ mod tests {
         assert!(preferred_fingerprint_for_attach(&fps).is_none());
     }
 
-    // ── list_agent_keys ───────────────────────────────────────────────────────
+    // ── preferred_fingerprint ordering ───────────────────────────────────────
+
+    #[test]
+    fn preferred_fingerprint_ecdsa_before_rsa512() {
+        let fps = vec![
+            make_fp("rsa-sha2-512", "RSA512FP"),
+            make_fp("ecdsa-sha2-nistp256", "ECDSAFP"),
+        ];
+        let result = preferred_fingerprint_for_attach(&fps).expect("should return a fingerprint");
+        assert_eq!(result.algorithm, "ecdsa-sha2-nistp256");
+    }
+
+    #[test]
+    fn preferred_fingerprint_rsa512_before_rsa256() {
+        let fps = vec![
+            make_fp("rsa-sha2-256", "RSA256FP"),
+            make_fp("rsa-sha2-512", "RSA512FP"),
+        ];
+        let result = preferred_fingerprint_for_attach(&fps).expect("should return a fingerprint");
+        assert_eq!(result.algorithm, "rsa-sha2-512");
+    }
+
+    #[test]
+    fn preferred_fingerprint_full_order_ed25519_wins() {
+        let fps = vec![
+            make_fp("rsa-sha2-256", "RSA256FP"),
+            make_fp("rsa-sha2-512", "RSA512FP"),
+            make_fp("ecdsa-sha2-nistp256", "ECDSAFP"),
+            make_fp("ssh-ed25519", "ED25519FP"),
+        ];
+        let result = preferred_fingerprint_for_attach(&fps).expect("should return a fingerprint");
+        assert_eq!(result.algorithm, "ssh-ed25519");
+    }
+
+    // ── list_agent_keys wire protocol ────────────────────────────────────────
+
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixListener;
+
+    // Serialize all tests that mutate SSH_AUTH_SOCK so they don't race under
+    // cargo's default parallel test runner.
+    static SSH_AUTH_SOCK_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
+        std::sync::OnceLock::new();
+    fn ssh_auth_sock_guard() -> std::sync::MutexGuard<'static, ()> {
+        SSH_AUTH_SOCK_LOCK.get_or_init(|| std::sync::Mutex::new(())).lock().unwrap()
+    }
+
+    /// Binds a Unix socket at `path` and spawns a background thread that accepts
+    /// one connection, drains the request (discarded), and writes `response`. The
+    /// socket is bound before this function returns so the caller can connect
+    /// immediately.
+    fn spawn_agent_responder(path: &std::path::Path, response: Vec<u8>) {
+        let listener = UnixListener::bind(path).unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 64];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(&response);
+            }
+        });
+    }
+
+    fn frame(body: &[u8]) -> Vec<u8> {
+        let mut v = (body.len() as u32).to_be_bytes().to_vec();
+        v.extend_from_slice(body);
+        v
+    }
+
+    fn agent_failure_frame() -> Vec<u8> {
+        frame(&[SSH_AGENT_FAILURE])
+    }
+
+    /// A length prefix exceeding MAX_AGENT_REPLY with no body bytes following.
+    fn agent_oversized_len_frame() -> Vec<u8> {
+        ((MAX_AGENT_REPLY as u32) + 1).to_be_bytes().to_vec()
+    }
+
+    fn agent_one_ed25519_key_frame() -> Vec<u8> {
+        let alg = b"ssh-ed25519";
+        let key_data = [0u8; 32];
+
+        // key blob: [4-byte len][alg bytes][4-byte len][key bytes]
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&(alg.len() as u32).to_be_bytes());
+        blob.extend_from_slice(alg);
+        blob.extend_from_slice(&(key_data.len() as u32).to_be_bytes());
+        blob.extend_from_slice(&key_data);
+
+        let comment = b"test-key";
+
+        let mut body = Vec::new();
+        body.push(SSH2_AGENT_IDENTITIES_ANSWER);
+        body.extend_from_slice(&1u32.to_be_bytes());
+        body.extend_from_slice(&(blob.len() as u32).to_be_bytes());
+        body.extend_from_slice(&blob);
+        body.extend_from_slice(&(comment.len() as u32).to_be_bytes());
+        body.extend_from_slice(comment);
+
+        frame(&body)
+    }
 
     #[test]
     fn list_agent_keys_unconnectable_socket() {
+        let _g = ssh_auth_sock_guard();
         // Point SSH_AUTH_SOCK to a nonexistent path so the connect fails.
         std::env::set_var("SSH_AUTH_SOCK", "/nonexistent/path/agent.sock");
         let result = list_agent_keys();
@@ -355,5 +455,59 @@ mod tests {
             matches!(result, Err(mux_core::error::MuxError::SshAgentNotForwarded)),
             "expected SshAgentNotForwarded, got {result:?}"
         );
+    }
+
+    #[test]
+    fn list_agent_keys_no_auth_sock_env_returns_not_forwarded() {
+        let _g = ssh_auth_sock_guard();
+        std::env::remove_var("SSH_AUTH_SOCK");
+        let result = list_agent_keys();
+        assert!(
+            matches!(result, Err(mux_core::error::MuxError::SshAgentNotForwarded)),
+            "expected SshAgentNotForwarded when SSH_AUTH_SOCK is unset, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn list_agent_keys_agent_returns_failure() {
+        let _g = ssh_auth_sock_guard();
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("agent-fail.sock");
+        spawn_agent_responder(&sock, agent_failure_frame());
+        std::env::set_var("SSH_AUTH_SOCK", sock.to_str().unwrap());
+        let result = list_agent_keys();
+        assert!(
+            matches!(result, Err(mux_core::error::MuxError::SshAgentNotForwarded)),
+            "expected SshAgentNotForwarded for SSH_AGENT_FAILURE, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn list_agent_keys_oversized_reply_returns_not_forwarded() {
+        let _g = ssh_auth_sock_guard();
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("agent-oversized.sock");
+        spawn_agent_responder(&sock, agent_oversized_len_frame());
+        std::env::set_var("SSH_AUTH_SOCK", sock.to_str().unwrap());
+        let result = list_agent_keys();
+        assert!(
+            matches!(result, Err(mux_core::error::MuxError::SshAgentNotForwarded)),
+            "expected SshAgentNotForwarded for oversized reply, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn list_agent_keys_valid_reply_returns_keys() {
+        let _g = ssh_auth_sock_guard();
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("agent-ok.sock");
+        spawn_agent_responder(&sock, agent_one_ed25519_key_frame());
+        std::env::set_var("SSH_AUTH_SOCK", sock.to_str().unwrap());
+        let result = list_agent_keys().expect("should succeed with valid agent response");
+        assert_eq!(result.len(), 1, "expected exactly one key");
+        assert_eq!(result[0].algorithm, "ssh-ed25519");
+        assert_eq!(result[0].comment, "test-key");
+        // key blob: 4-byte len(11) + "ssh-ed25519" + 4-byte len(32) + 32 zero bytes = 51
+        assert_eq!(result[0].key_blob.len(), 51);
     }
 }

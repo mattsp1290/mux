@@ -182,4 +182,50 @@ mod tests {
             TransportMode::Tcp
         );
     }
+
+    // ── read_force_transport (reads env var) ──────────────────────────────────
+
+    // Serialize env-mutating tests to prevent parallel-runner races.
+    static FORCE_TRANSPORT_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
+        std::sync::OnceLock::new();
+    fn force_transport_guard() -> std::sync::MutexGuard<'static, ()> {
+        FORCE_TRANSPORT_LOCK.get_or_init(|| std::sync::Mutex::new(())).lock().unwrap()
+    }
+
+    #[test]
+    fn read_force_transport_unset_returns_none() {
+        let _g = force_transport_guard();
+        std::env::remove_var(MUX_FORCE_TRANSPORT_ENV);
+        assert_eq!(read_force_transport().unwrap(), None);
+    }
+
+    #[test]
+    fn read_force_transport_streamlocal() {
+        let _g = force_transport_guard();
+        std::env::set_var(MUX_FORCE_TRANSPORT_ENV, "streamlocal");
+        let result = read_force_transport().unwrap();
+        std::env::remove_var(MUX_FORCE_TRANSPORT_ENV);
+        assert_eq!(result, Some(TransportMode::Streamlocal));
+    }
+
+    #[test]
+    fn read_force_transport_tcp() {
+        let _g = force_transport_guard();
+        std::env::set_var(MUX_FORCE_TRANSPORT_ENV, "tcp");
+        let result = read_force_transport().unwrap();
+        std::env::remove_var(MUX_FORCE_TRANSPORT_ENV);
+        assert_eq!(result, Some(TransportMode::Tcp));
+    }
+
+    #[test]
+    fn read_force_transport_invalid_errors() {
+        let _g = force_transport_guard();
+        std::env::set_var(MUX_FORCE_TRANSPORT_ENV, "rdma");
+        let result = read_force_transport();
+        std::env::remove_var(MUX_FORCE_TRANSPORT_ENV);
+        assert!(
+            matches!(result, Err(MuxError::InvalidForceTransport(ref s)) if s == "rdma"),
+            "expected InvalidForceTransport(\"rdma\"), got {result:?}"
+        );
+    }
 }
