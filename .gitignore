@@ -20,6 +20,9 @@ bin-release/
 # Rust build output
 /target/
 
+# Release artifact staging directory (populated by cross build + release workflow)
+/dist/
+
 # Beads / Dolt files (added by bd init)
 .dolt/
 *.db
