@@ -122,6 +122,8 @@ pub async fn run(command: Command, mux_home: PathBuf) -> Result<()> {
             crate::host::run_host(action, store.conn()).await
         }
         Command::Agent { .. } => todo!("mux agent"),
+        // TODO: wire to run_create once a real SshHost SSH impl lands (currently
+        // no production SSH executor exists; the create module is tested in isolation).
         Command::Create { .. } => anyhow::bail!("mux create: SSH execution not yet implemented"),
         Command::Attach => todo!("mux attach"),
         Command::List => todo!("mux list"),

@@ -79,7 +79,15 @@ pub struct CreateResult {
 ///
 /// Returns `CreateResult` on success. On failure after the session reservation
 /// has been written, the reservation is always cancelled. If the workdir was
-/// created before the failure, it is removed (only when `is_safe_to_remove`).
+/// created before the failure, the per-session parent (`$REMOTE_MUX_HOME/<uuid>`)
+/// is removed best-effort via remote `rm -rf`. The path is always mux-constructed
+/// so it is structurally safe to remove; the local `is_safe_to_remove` FS check
+/// cannot apply to a remote path.
+///
+/// # Blocking I/O
+/// All SSH commands and the `AgentStarter` poll loop use synchronous blocking I/O.
+/// Callers on a Tokio multi-thread runtime should wrap this in
+/// `tokio::task::spawn_blocking`; the only async operation is the RPC in Step 9.
 pub async fn run_create<S: SshHost>(ctx: CreateContext<'_, S>) -> Result<CreateResult, MuxError> {
     let now = unix_now();
 
@@ -135,8 +143,18 @@ pub async fn run_create<S: SshHost>(ctx: CreateContext<'_, S>) -> Result<CreateR
 
     let tofu_result = match ctx.ssh.host_key() {
         Ok(info) => {
-            mux_ssh::trust::check_host_key(ctx.conn, ctx.host.id, &info.algorithm, &info.fingerprint)
-                .map_err(MuxError::Other)?
+            match mux_ssh::trust::check_host_key(
+                ctx.conn,
+                ctx.host.id,
+                &info.algorithm,
+                &info.fingerprint,
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    cancel_reservation(ctx.conn, &uuid);
+                    return Err(MuxError::Other(e));
+                }
+            }
         }
         Err(e) => {
             cancel_reservation(ctx.conn, &uuid);
@@ -161,13 +179,23 @@ pub async fn run_create<S: SshHost>(ctx: CreateContext<'_, S>) -> Result<CreateR
             );
             eprintln!("{algorithm} key fingerprint is {fingerprint}");
             eprintln!("Are you sure you want to continue connecting? (yes/no): ");
-            let accepted = read_yes_no()?;
+            let accepted = match read_yes_no() {
+                Ok(a) => a,
+                Err(e) => {
+                    cancel_reservation(ctx.conn, &uuid);
+                    return Err(e);
+                }
+            };
             if !accepted {
                 cancel_reservation(ctx.conn, &uuid);
                 return Err(MuxError::HostKeyRejected);
             }
-            mux_ssh::trust::trust_fingerprint(ctx.conn, ctx.host.id, &algorithm, &fingerprint)
-                .map_err(MuxError::Other)?;
+            if let Err(e) =
+                mux_ssh::trust::trust_fingerprint(ctx.conn, ctx.host.id, &algorithm, &fingerprint)
+            {
+                cancel_reservation(ctx.conn, &uuid);
+                return Err(MuxError::Other(e));
+            }
         }
         TrustCheckResult::Mismatch { .. } => {
             cancel_reservation(ctx.conn, &uuid);
@@ -177,7 +205,13 @@ pub async fn run_create<S: SshHost>(ctx: CreateContext<'_, S>) -> Result<CreateR
 
     // ── Step 5: Transport probing ─────────────────────────────────────────────
 
-    let forced_transport = mux_ssh::transport::read_force_transport()?;
+    let forced_transport = match mux_ssh::transport::read_force_transport() {
+        Ok(t) => t,
+        Err(e) => {
+            cancel_reservation(ctx.conn, &uuid);
+            return Err(e);
+        }
+    };
 
     let transport_mode = if let Some(forced) = forced_transport {
         forced
@@ -226,9 +260,16 @@ pub async fn run_create<S: SshHost>(ctx: CreateContext<'_, S>) -> Result<CreateR
     let workdir_str = workdir.to_string_lossy().into_owned();
 
     // Create the parent directory.
-    let (mkdir_code, _, mkdir_stderr) = ctx
+    let (mkdir_code, _, mkdir_stderr) = match ctx
         .ssh
-        .run(&format!("mkdir -p {}", sh_quote(&workdir_parent_str)))?;
+        .run(&format!("mkdir -p {}", sh_quote(&workdir_parent_str)))
+    {
+        Ok(r) => r,
+        Err(e) => {
+            cancel_reservation(ctx.conn, &uuid);
+            return Err(e);
+        }
+    };
     if mkdir_code != 0 {
         cancel_reservation(ctx.conn, &uuid);
         return Err(MuxError::Other(anyhow::anyhow!(
@@ -238,9 +279,13 @@ pub async fn run_create<S: SshHost>(ctx: CreateContext<'_, S>) -> Result<CreateR
     }
 
     // Guard: workdir must not already exist.
-    let (test_code, _, _) = ctx
-        .ssh
-        .run(&format!("test -d {}", sh_quote(&workdir_str)))?;
+    let (test_code, _, _) = match ctx.ssh.run(&format!("test -d {}", sh_quote(&workdir_str))) {
+        Ok(r) => r,
+        Err(e) => {
+            cancel_reservation(ctx.conn, &uuid);
+            return Err(e);
+        }
+    };
     if test_code == 0 {
         cancel_reservation(ctx.conn, &uuid);
         return Err(MuxError::WorkdirPreExisting(workdir.clone()));
@@ -256,11 +301,18 @@ pub async fn run_create<S: SshHost>(ctx: CreateContext<'_, S>) -> Result<CreateR
         sh_quote(&workdir_str),
     );
 
-    let (clone_code, _, clone_stderr) = ctx.ssh.run(&clone_cmd)?;
+    let (clone_code, _, clone_stderr) = match ctx.ssh.run(&clone_cmd) {
+        Ok(r) => r,
+        Err(e) => {
+            cancel_reservation(ctx.conn, &uuid);
+            let _ = ctx.ssh.run(&format!("rm -rf {}", sh_quote(&workdir_parent_str)));
+            return Err(e);
+        }
+    };
     if clone_code != 0 {
         cancel_reservation(ctx.conn, &uuid);
-        // Attempt workdir cleanup (best-effort, ignore errors).
-        let _ = ctx.ssh.run(&format!("rm -rf {}", sh_quote(&workdir_str)));
+        // Attempt cleanup (best-effort, ignore errors).
+        let _ = ctx.ssh.run(&format!("rm -rf {}", sh_quote(&workdir_parent_str)));
         return Err(MuxError::GitCloneFailed {
             exit_code: clone_code,
             stderr: truncate_stderr(&clone_stderr),
@@ -273,13 +325,17 @@ pub async fn run_create<S: SshHost>(ctx: CreateContext<'_, S>) -> Result<CreateR
         Ok(urls) => urls,
         Err(e) => {
             cancel_reservation(ctx.conn, &uuid);
-            let _ = ctx.ssh.run(&format!("rm -rf {}", sh_quote(&workdir_str)));
+            let _ = ctx.ssh.run(&format!("rm -rf {}", sh_quote(&workdir_parent_str)));
             return Err(e);
         }
     };
 
     // ── Step 9: RPC — create session ─────────────────────────────────────────
 
+    // TODO: establish SSH port-forward before connecting; RpcClient should use
+    // the forwarded local port, not the remote agent's address directly.
+    // For now this always connects to loopback, which only works when running
+    // on the same machine as the agent (not the intended production topology).
     let rpc_client = mux_rpc::client::RpcClient::tcp("127.0.0.1", agent_urls.tcp_port());
     let rpc_req = mux_rpc::schema::CreateSessionRequest {
         uuid: uuid.clone(),
@@ -294,7 +350,7 @@ pub async fn run_create<S: SshHost>(ctx: CreateContext<'_, S>) -> Result<CreateR
         Ok(resp) => resp,
         Err(e) => {
             cancel_reservation(ctx.conn, &uuid);
-            let _ = ctx.ssh.run(&format!("rm -rf {}", sh_quote(&workdir_str)));
+            let _ = ctx.ssh.run(&format!("rm -rf {}", sh_quote(&workdir_parent_str)));
             return Err(e);
         }
     };
