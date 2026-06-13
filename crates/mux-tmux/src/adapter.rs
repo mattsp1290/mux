@@ -797,7 +797,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn new_session_with_status_right_issues_three_calls_in_order() {
+    async fn new_session_with_status_right_issues_three_calls() {
+        // Contract: new-session is always first. The two set-option calls are applied
+        // AFTER new-session but their relative order is deliberately unspecified.
         let spy = TmuxSpy::new();
         spy.adapter()
             .new_session("mux-s", "/tmp", Some("session: test [ok]"))
@@ -809,18 +811,18 @@ mod tests {
         // First call must be new-session (session must exist before set-option).
         assert_eq!(calls[0][0], "new-session", "first call must be new-session");
 
-        // Second call: enable status bar.
-        assert_eq!(
-            calls[1],
-            &["set-option", "-t", "mux-s", "status", "on"],
-            "second call must enable status with 'on' (not '1')"
+        // The two set-option calls may arrive in any order — check as a set.
+        let set_option_calls: Vec<&Vec<String>> = calls.iter().skip(1).collect();
+        assert!(
+            set_option_calls
+                .iter()
+                .any(|c| c.as_slice() == ["set-option", "-t", "mux-s", "status", "on"]),
+            "set-option for status=on (not '1') must be present; got: {set_option_calls:?}"
         );
-
-        // Third call: set status-right content.
-        assert_eq!(
-            calls[2],
-            &["set-option", "-t", "mux-s", "status-right", "session: test [ok]"],
-            "third call must set status-right"
+        assert!(
+            set_option_calls.iter().any(|c| c.as_slice()
+                == ["set-option", "-t", "mux-s", "status-right", "session: test [ok]"]),
+            "set-option for status-right must be present; got: {set_option_calls:?}"
         );
     }
 
