@@ -138,6 +138,9 @@ fn lock_json(port: u16) -> String {
 }
 
 fn agent_running_responses(port: u16) -> Vec<(i32, String, String)> {
+    // Two responses in order:
+    //   [0] → `cat agent.lock` returns the lock JSON (agent is running at port)
+    //   [1] → `kill -0 <pid>` returns exit 0 (process is alive)
     vec![(0, lock_json(port), String::new()), (0, String::new(), String::new())]
 }
 
@@ -171,17 +174,19 @@ async fn status_resolves_by_shortname() {
 
 #[tokio::test]
 async fn status_uuid_format_no_shortname_fallback() {
-    // UUID format that doesn't exist → hard error; must NOT attempt shortname lookup.
-    // (Behaviour: resolve_session returns error without touching shortname index.)
+    // Proves: UUID-format selector → UUID lookup only; no fallback to shortname.
+    //
+    // The session's shortname is set to the SAME string as the UUID selector.
+    // If resolve_session fell back to shortname lookup, run_status would succeed
+    // (shortname matches). Since there's no fallback, it returns "not found".
     let (_dir, store) = open_store();
     let conn = store.conn();
     let host_id = insert_host(conn);
-    // Insert a session whose shortname happens to match a UUID-shaped string.
-    // (Contrived but proves the selector is treated as UUID, not shortname.)
-    insert_active_session(conn, host_id, "cccccccc-cccc-cccc-cccc-cccccccccccc", "matchme");
+    let selector = "00000000-0000-0000-0000-000000000000";
+    // Real UUID differs from selector; shortname equals selector.
+    insert_active_session(conn, host_id, "cccccccc-cccc-cccc-cccc-cccccccccccc", selector);
 
-    let missing_uuid = "00000000-0000-0000-0000-000000000000";
-    let err = run_status(make_ctx(conn, MockRemoteExec::unreachable(), missing_uuid))
+    let err = run_status(make_ctx(conn, MockRemoteExec::unreachable(), selector))
         .await
         .unwrap_err();
     assert!(err.to_string().contains("not found"), "got: {err}");
@@ -226,6 +231,31 @@ async fn status_live_path_success() {
     run_status(make_ctx(conn, ssh, uuid))
         .await
         .expect("live path must succeed");
+
+    // docs/07 §5: no mutation during status, even on the live path.
+    let s = session_repo::get_by_uuid(conn, uuid).unwrap().unwrap();
+    assert_eq!(s.status, "active", "live path must not mutate session status");
+}
+
+#[tokio::test]
+async fn status_live_rpc_error_is_surfaced() {
+    // docs/07 §4: non-not_found RPC errors must propagate up, not be swallowed.
+    let (_dir, store) = open_store();
+    let conn = store.conn();
+    let host_id = insert_host(conn);
+    let uuid = "d1d1d1d1-d1d1-d1d1-d1d1-d1d1d1d1d1d1";
+    insert_active_session(conn, host_id, uuid, "errapp");
+
+    let port = spawn_rpc_server(encode_get_session_err(RpcError::internal("agent_panic: boom")))
+        .await;
+    let ssh = MockRemoteExec::new(agent_running_responses(port));
+
+    let err = run_status(make_ctx(conn, ssh, uuid))
+        .await
+        .unwrap_err();
+    // Error must surface (not be silently swallowed as "local fallback").
+    let msg = err.to_string();
+    assert!(!msg.is_empty(), "non-not_found RPC error must propagate");
 }
 
 #[tokio::test]
