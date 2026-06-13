@@ -1,0 +1,20 @@
+[package]
+name = "mux-integration-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+description = "End-to-end integration tests requiring Docker and SSH"
+
+[features]
+integration-tests = []
+
+[[test]]
+name = "integration"
+path = "../../tests/integration/main.rs"
+required-features = ["integration-tests"]
+
+[dev-dependencies]
+tempfile.workspace = true
+rusqlite.workspace = true
