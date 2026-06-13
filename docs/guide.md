@@ -55,7 +55,7 @@ After that, creating and attaching to sessions is just:
 
 ```
 mux create owner/repo --host myserver
-mux attach myserver/myproject
+mux attach myproject
 ```
 
 ---
@@ -150,6 +150,8 @@ mux create alice/myproject --host myserver --branch feature/my-branch
 4. Records the session in local state.
 
 `--branch` defaults to the repository's default branch. Use it to check out a specific branch from the start.
+
+`--host` is required unless you have a default host configured.
 
 You must have `ssh-agent` running with a key that has access to the remote host **and** to the Git host (GitHub, GitLab, etc.).
 
@@ -307,7 +309,7 @@ Accept the fingerprint interactively, then retry the original command.
 
 ### `mux: workdir_pre_existing`
 
-The working directory that `mux create` would create already exists on the remote host.
+The working directory that `mux create` would create already exists on the remote host. The directory is at `~/.mux/<uuid>/<repo-name>` on the remote.
 
 Either remove the existing directory on the remote host, or create the session on a different host.
 
