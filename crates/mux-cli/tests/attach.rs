@@ -10,6 +10,8 @@ use mux_state::store::Store;
 use tempfile::TempDir;
 
 // ── MockSshHost ───────────────────────────────────────────────────────────────
+// Integration crates cannot reach #[cfg(test)] items in the lib, so this
+// duplicates the inline MockSshHost from src/attach.rs mod tests.
 
 struct MockSshHost {
     host_key_result: Result<HostKeyInfo, MuxError>,
@@ -42,6 +44,22 @@ impl SshHost for MockSshHost {
             Ok(k) => Ok(k.clone()),
             Err(e) => Err(MuxError::Other(anyhow::anyhow!("{e}"))),
         }
+    }
+}
+
+// PanicOnProbe enforces that neither host_key() nor run() is called.
+// Used to make the "gate fires first" invariant observable, not incidental.
+struct PanicOnProbe;
+
+impl RemoteExec for PanicOnProbe {
+    fn run(&self, _cmd: &str) -> Result<(i32, String, String), MuxError> {
+        panic!("attach must not call run() before the dead-session gate");
+    }
+}
+
+impl SshHost for PanicOnProbe {
+    fn host_key(&self) -> Result<HostKeyInfo, MuxError> {
+        panic!("attach must not probe host_key() before the dead-session gate");
     }
 }
 
@@ -113,9 +131,9 @@ fn dead_session_errors_before_ssh() {
     insert_active_session(conn, host_id, uuid, "myapp");
     session_repo::set_status(conn, uuid, "dead", 1_000_002).unwrap();
 
-    // MockSshHost::host_key would panic if called; run() errors. The dead-session
-    // gate must fire before any SSH interaction.
-    let err = prepare_attach(make_ctx(conn, MockSshHost::ed25519("FP"), uuid)).unwrap_err();
+    // PanicOnProbe panics if host_key() or run() is reached; the dead-session
+    // gate at src/attach.rs:59 must fire before any SSH interaction.
+    let err = prepare_attach(make_ctx(conn, PanicOnProbe, uuid)).unwrap_err();
     assert!(err.to_string().contains("dead"), "expected dead error, got: {err}");
 }
 
@@ -228,9 +246,11 @@ fn ssh_argv_uses_stored_tmux_name() {
     trust_ed25519(conn, host_id);
 
     let inv = prepare_attach(make_ctx(conn, MockSshHost::ed25519("FP"), uuid)).unwrap();
-    assert!(
-        inv.argv.contains(&"mux-myapp".to_owned()),
-        "argv must contain tmux_name 'mux-myapp'; got: {:?}",
+    let tail = &inv.argv[inv.argv.len() - 4..];
+    assert_eq!(
+        tail,
+        &["tmux", "attach-session", "-t", "mux-myapp"],
+        "argv tail must be 'tmux attach-session -t mux-myapp'; got: {:?}",
         inv.argv
     );
 }
@@ -247,9 +267,13 @@ fn ssh_argv_has_pseudo_tty_flag() {
     trust_ed25519(conn, host_id);
 
     let inv = prepare_attach(make_ctx(conn, MockSshHost::ed25519("FP"), uuid)).unwrap();
+    // argv contains -t twice: SSH pseudo-TTY flag and `tmux attach-session -t <name>`.
+    // Assert the SSH -t appears *before* the user@host target to distinguish them.
+    let target_idx = inv.argv.iter().position(|a| a.starts_with("user@")).unwrap();
+    let ssh_t = inv.argv[..target_idx].iter().any(|a| a == "-t");
     assert!(
-        inv.argv.contains(&"-t".to_owned()),
-        "argv must contain -t for pseudo-TTY; got: {:?}",
+        ssh_t,
+        "argv must contain SSH -t (pseudo-TTY) before the target; got: {:?}",
         inv.argv
     );
 }
@@ -269,13 +293,14 @@ fn known_hosts_file_exists_on_disk() {
     let kh_arg = find_opt(&inv, "UserKnownHostsFile=").expect("UserKnownHostsFile must be present");
     let path = kh_arg.strip_prefix("UserKnownHostsFile=").unwrap();
     assert_ne!(path, "/dev/null", "known_hosts must not be /dev/null");
-    assert!(
-        std::path::Path::new(path).exists(),
-        "known_hosts file must exist on disk at {path}"
-    );
+    let meta = std::fs::metadata(path).expect("known_hosts file must exist on disk");
+    assert!(meta.is_file(), "known_hosts path must be a file");
+    // File must be empty: mux stores only the fingerprint hash, not the raw key blob.
+    // Writing key material would defeat the empty-known_hosts security model.
+    assert_eq!(meta.len(), 0, "known_hosts must be empty (no raw key blob)");
 }
 
-// ── 10. IPv6 address gets brackets in SSH target ──────────────────────────────
+// ── 10. IPv6 address gets brackets in SSH target ─────────────────────────────
 
 #[test]
 fn ipv6_address_bracketed_in_ssh_target() {
@@ -292,6 +317,9 @@ fn ipv6_address_bracketed_in_ssh_target() {
         "IPv6 addr must be bracketed in target; got: {:?}",
         inv.argv
     );
+    // IPv6 path must still emit all security options (no different argv branch).
+    assert!(find_opt(&inv, "HostKeyAlgorithms=").is_some(), "HostKeyAlgorithms must be present on IPv6 path");
+    assert!(find_opt(&inv, "UserKnownHostsFile=").is_some(), "UserKnownHostsFile must be present on IPv6 path");
 }
 
 // ── 11. RSA pins both SHA-2 variants in correct order ────────────────────────
@@ -336,5 +364,91 @@ fn unknown_algorithm_passes_through_verbatim() {
         inv.argv.contains(&"HostKeyAlgorithms=x-custom-algo".to_owned()),
         "unknown algorithm must pass through verbatim; got: {:?}",
         inv.argv
+    );
+}
+
+// ── 13. ECDSA algorithm pins single variant ───────────────────────────────────
+
+#[test]
+fn ecdsa_algorithm_pins_single_variant() {
+    let (_dir, store) = open_store();
+    let conn = store.conn();
+    let host_id = insert_host(conn);
+    let uuid = "66666666-6666-6666-6666-666666666666";
+    insert_active_session(conn, host_id, uuid, "ecdsaapp");
+    mux_ssh::trust::trust_fingerprint(conn, host_id, "ecdsa-sha2-nistp256", "ECDSAFP").unwrap();
+
+    let inv = prepare_attach(make_ctx(
+        conn,
+        MockSshHost::with_key("ecdsa-sha2-nistp256", "ECDSAFP"),
+        uuid,
+    ))
+    .unwrap();
+    assert!(
+        inv.argv.contains(&"HostKeyAlgorithms=ecdsa-sha2-nistp256".to_owned()),
+        "ECDSA must pin ecdsa-sha2-nistp256; got: {:?}",
+        inv.argv
+    );
+}
+
+// ── 14. Port appears in argv ──────────────────────────────────────────────────
+
+#[test]
+fn ssh_argv_contains_port() {
+    let (_dir, store) = open_store();
+    let conn = store.conn();
+    let host_id = insert_host(conn);
+    let uuid = "77777777-7777-7777-7777-777777777777";
+    insert_active_session(conn, host_id, uuid, "portapp");
+    trust_ed25519(conn, host_id);
+
+    let inv = prepare_attach(make_ctx(conn, MockSshHost::ed25519("FP"), uuid)).unwrap();
+    let port_idx = inv.argv.iter().position(|a| a == "-p").expect("-p must be present");
+    assert_eq!(inv.argv[port_idx + 1], "22", "port must be 22; got: {:?}", inv.argv);
+}
+
+// ── 15. Shortname selector resolves ──────────────────────────────────────────
+
+#[test]
+fn shortname_selector_resolves_to_session() {
+    let (_dir, store) = open_store();
+    let conn = store.conn();
+    let host_id = insert_host(conn);
+    let uuid = "88888888-8888-8888-8888-888888888888";
+    insert_active_session(conn, host_id, uuid, "shortapp");
+    trust_ed25519(conn, host_id);
+
+    let inv = prepare_attach(make_ctx(conn, MockSshHost::ed25519("FP"), "shortapp")).unwrap();
+    let tail = &inv.argv[inv.argv.len() - 4..];
+    assert_eq!(tail, &["tmux", "attach-session", "-t", "mux-shortapp"]);
+}
+
+// ── 16. Reserved-but-not-active session errors with "no tmux name" ───────────
+
+#[test]
+fn reserved_session_without_tmux_name_errors() {
+    let (_dir, store) = open_store();
+    let conn = store.conn();
+    let host_id = insert_host(conn);
+    let uuid = "99999999-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+    // Reserve but do NOT activate — tmux_name stays None.
+    session_repo::reserve(
+        conn,
+        &ReserveParams {
+            uuid,
+            host_id,
+            shortname: "inflightapp",
+            repo_slug: "owner/repo",
+            branch: "main",
+            created_at: 1_000_000,
+        },
+    )
+    .unwrap();
+    trust_ed25519(conn, host_id);
+
+    let err = prepare_attach(make_ctx(conn, MockSshHost::ed25519("FP"), uuid)).unwrap_err();
+    assert!(
+        err.to_string().contains("no tmux name"),
+        "expected 'no tmux name' error for reserved session, got: {err}"
     );
 }
