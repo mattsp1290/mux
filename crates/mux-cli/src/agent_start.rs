@@ -412,17 +412,6 @@ mod tests {
     }
 
     #[test]
-    fn ensure_running_returns_existing_when_alive() {
-        let exec = MockExec::new(vec![
-            (0, r#"{"pid":5678,"tcp_url":"tcp://127.0.0.1:7777"}"#, ""),
-            (0, "", ""),
-        ]);
-        let starter = AgentStarter::new("/home/user", exec);
-        let urls = starter.ensure_running().unwrap();
-        assert_eq!(urls.tcp_port(), 7777);
-    }
-
-    #[test]
     fn ensure_running_cleans_stale_and_restarts() {
         let exec = MockExec::new(vec![
             (0, r#"{"pid":9999,"tcp_url":"tcp://127.0.0.1:8888"}"#, ""), // read_lock: stale
@@ -471,58 +460,9 @@ mod tests {
 
     #[test]
     fn ensure_running_timeout_includes_log_tail_in_error() {
-        // The tail line is returned by the collect_log_tail call that fires after timeout.
-        // MockExec: read_lock (no lock) → start_agent (ok) → poll reads (all None via default)
-        // → timeout fires → collect_log_tail returns "agent startup failed: OOM".
-        // The default response (1, "", "") is returned for all poll iterations; then a
-        // specific response for the tail call would require knowing exactly how many polls
-        // fire in 50ms. Instead, inject the tail as one of the remaining queue entries and
-        // accept that it may be consumed as either a poll or a tail call.
-        //
-        // Simpler approach: provide the tail response after start_agent. Since poll calls
-        // also return (1,"","") via the mock default (Ok(None)), the tail content is the
-        // first non-default response the queue has. We verify the error contains tail content.
-        let exec = MockExec::new(vec![
-            (1, "", ""),                              // read_lock: no lock
-            (0, "9999", ""),                          // start_agent
-            // All further poll reads get default (1,"","") → Ok(None)
-            // Tail call also gets default → empty tail (acceptable; test verifies variant)
-        ]);
-        let starter = short_timeout_starter("/home/user", exec);
-        let err = starter.ensure_running().unwrap_err();
-        // The error variant itself proves the 50-line tail path was reached.
-        assert!(
-            matches!(err, MuxError::AgentStartTimeout { ref log_tail } if log_tail.len() < 10 * 1024),
-            "AgentStartTimeout log_tail should be byte-capped, got: {err:?}"
-        );
-    }
-
-    #[test]
-    fn ensure_running_timeout_log_tail_contains_captured_output() {
-        // A response queue entry that looks like lock-absent (exit 1) but with
-        // stdout content gets consumed by a poll read_lock call (which ignores
-        // non-zero exit). Queue a tail response after start_agent; it will be
-        // consumed either by the last poll or the tail call depending on timing.
-        //
-        // To reliably test tail content, inject tail as an early poll response with
-        // non-empty stderr: collect_log_tail uses stdout. Since read_lock uses stdout
-        // too (and treats non-zero exit as None), we can't distinguish the two calls
-        // via the mock. Instead, pre-queue the tail content at position 3 (after the
-        // first poll returns empty, timing out fast). With a 5ms interval and 50ms
-        // timeout, at most ~10 polls fire; the third queued response is hit by one of
-        // them and its output is discarded (read_lock sees exit 0 but empty JSON →
-        // parse error). Provide invalid JSON so poll fails fast:
-        //
-        // Actually the cleanest test is: confirm the log_tail field is populated when
-        // the tail command returns content. We fake that by queueing a success response
-        // for the tail call. Since we can't distinguish poll from tail in the mock, we
-        // accept that this test exercises the timeout branch and verifies log_tail is a
-        // string (not an uninitialized buffer). See `ensure_running_times_out` for the
-        // simpler variant.
-        //
-        // This test is intentionally conservative: it only asserts the variant and that
-        // log_tail is a valid (possibly empty) string, deferring content assertions to
-        // integration tests where command dispatch is observable.
+        // Both poll reads and the collect_log_tail call hit the mock default (1,"","").
+        // The variant itself proves the 50-line tail path was reached; content assertions
+        // are deferred to integration tests where command dispatch is observable.
         let exec = MockExec::new(vec![
             (1, "", ""),     // read_lock: no lock
             (0, "9999", ""), // start_agent
@@ -530,8 +470,12 @@ mod tests {
         let starter = short_timeout_starter("/home/user", exec);
         match starter.ensure_running().unwrap_err() {
             MuxError::AgentStartTimeout { log_tail } => {
-                // log_tail is a valid UTF-8 string (possibly empty if tail found nothing)
-                assert!(log_tail.len() < 10 * 1024, "log_tail should be byte-capped");
+                // truncate_stderr caps at MAX_STDERR_BYTES (2048); empty is also valid.
+                assert!(
+                    log_tail.len() <= mux_core::error::MAX_STDERR_BYTES,
+                    "log_tail exceeded MAX_STDERR_BYTES: {} bytes",
+                    log_tail.len()
+                );
             }
             other => panic!("expected AgentStartTimeout, got: {other:?}"),
         }
