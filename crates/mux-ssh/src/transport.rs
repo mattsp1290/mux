@@ -1,4 +1,4 @@
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Duration;
@@ -22,7 +22,11 @@ pub fn probe_transport(streamlocal_path: &Path, loopback_port: u16) -> Result<Tr
     if probe_tcp_loopback(loopback_port) {
         return Ok(TransportMode::Tcp);
     }
-    Err(MuxError::ConnectionRefused(format!("127.0.0.1:{loopback_port}")))
+    Err(MuxError::ConnectionRefused(format!(
+        "streamlocal:{} and 127.0.0.1:{}",
+        streamlocal_path.display(),
+        loopback_port
+    )))
 }
 
 /// Check if a Unix domain socket at `path` is connectable.
@@ -32,13 +36,16 @@ pub fn probe_streamlocal(path: &Path) -> bool {
 
 /// Check if TCP 127.0.0.1:port is connectable within PROBE_TIMEOUT.
 pub fn probe_tcp_loopback(port: u16) -> bool {
-    let addr = format!("127.0.0.1:{port}");
-    match addr.to_socket_addrs() {
-        Ok(mut addrs) => addrs
-            .next()
-            .map(|a| TcpStream::connect_timeout(&a, PROBE_TIMEOUT).is_ok())
-            .unwrap_or(false),
-        Err(_) => false,
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    TcpStream::connect_timeout(&addr, PROBE_TIMEOUT).is_ok()
+}
+
+/// Parse a MUX_FORCE_TRANSPORT value from an optional string.
+/// `None` input (unset env var) → `Ok(None)`. Invalid string → `Err`.
+pub fn parse_force_transport(val: Option<&str>) -> Result<Option<TransportMode>, MuxError> {
+    match val {
+        None => Ok(None),
+        Some(s) => Ok(Some(s.parse::<TransportMode>()?)),
     }
 }
 
@@ -46,13 +53,8 @@ pub fn probe_tcp_loopback(port: u16) -> bool {
 /// Returns `None` if the variable is not set.
 /// Returns `Err(MuxError::InvalidForceTransport)` if set to an invalid value.
 pub fn read_force_transport() -> Result<Option<TransportMode>, MuxError> {
-    match std::env::var(MUX_FORCE_TRANSPORT_ENV) {
-        Err(_) => Ok(None),
-        Ok(val) => {
-            let mode = val.parse::<TransportMode>()?;
-            Ok(Some(mode))
-        }
-    }
+    let raw = std::env::var(MUX_FORCE_TRANSPORT_ENV).ok();
+    parse_force_transport(raw.as_deref())
 }
 
 /// Apply a MUX_FORCE_TRANSPORT override to the probed transport.
@@ -134,34 +136,33 @@ mod tests {
         assert!(matches!(result, Err(MuxError::ConnectionRefused(_))));
     }
 
-    // ── read_force_transport ──────────────────────────────────────────────────
+    // ── parse_force_transport (pure, no env mutation) ─────────────────────────
 
     #[test]
-    fn read_force_transport_unset_returns_none() {
-        std::env::remove_var(MUX_FORCE_TRANSPORT_ENV);
-        assert_eq!(read_force_transport().unwrap(), None);
+    fn parse_force_transport_none_returns_none() {
+        assert_eq!(parse_force_transport(None).unwrap(), None);
     }
 
     #[test]
-    fn read_force_transport_streamlocal() {
-        std::env::set_var(MUX_FORCE_TRANSPORT_ENV, "streamlocal");
-        assert_eq!(read_force_transport().unwrap(), Some(TransportMode::Streamlocal));
-        std::env::remove_var(MUX_FORCE_TRANSPORT_ENV);
+    fn parse_force_transport_streamlocal() {
+        assert_eq!(
+            parse_force_transport(Some("streamlocal")).unwrap(),
+            Some(TransportMode::Streamlocal)
+        );
     }
 
     #[test]
-    fn read_force_transport_tcp() {
-        std::env::set_var(MUX_FORCE_TRANSPORT_ENV, "tcp");
-        assert_eq!(read_force_transport().unwrap(), Some(TransportMode::Tcp));
-        std::env::remove_var(MUX_FORCE_TRANSPORT_ENV);
+    fn parse_force_transport_tcp() {
+        assert_eq!(
+            parse_force_transport(Some("tcp")).unwrap(),
+            Some(TransportMode::Tcp)
+        );
     }
 
     #[test]
-    fn read_force_transport_invalid_errors() {
-        std::env::set_var(MUX_FORCE_TRANSPORT_ENV, "quic");
-        let result = read_force_transport();
+    fn parse_force_transport_invalid_errors() {
+        let result = parse_force_transport(Some("quic"));
         assert!(matches!(result, Err(MuxError::InvalidForceTransport(s)) if s == "quic"));
-        std::env::remove_var(MUX_FORCE_TRANSPORT_ENV);
     }
 
     // ── select_transport ──────────────────────────────────────────────────────
