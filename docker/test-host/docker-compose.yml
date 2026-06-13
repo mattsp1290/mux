@@ -1,0 +1,12 @@
+services:
+  mux-test-host-a:
+    build: .
+    ports:
+      - "2221:22"
+    # Fixed port so test harness can hardcode localhost:2221
+
+  mux-test-host-b:
+    build: .
+    ports:
+      - "2222:22"
+    # Second host for multi-host session tests

@@ -1,0 +1,11 @@
+# mux integration test sshd configuration
+# Loaded from /etc/ssh/sshd_config.d/mux-test.conf
+
+AllowAgentForwarding yes
+PermitUserEnvironment yes
+PubkeyAuthentication yes
+PasswordAuthentication no
+ChallengeResponseAuthentication no
+UsePAM no
+PrintMotd no
+AcceptEnv LANG LC_*
