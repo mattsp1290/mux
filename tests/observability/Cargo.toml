@@ -1,0 +1,12 @@
+[package]
+name = "mux-observability-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+description = "Observability signal and event bus semantic tests"
+
+[dev-dependencies]
+mux-core = { path = "../../crates/mux-core" }
+tokio = { workspace = true }

@@ -567,6 +567,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "mux-observability-tests"
+version = "0.1.0"
+dependencies = [
+ "mux-core",
+ "tokio",
+]
+
+[[package]]
 name = "mux-rpc"
 version = "0.1.0"
 dependencies = [
