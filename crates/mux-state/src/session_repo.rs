@@ -433,6 +433,49 @@ mod tests {
     }
 
     #[test]
+    fn get_by_shortname_global_excludes_in_flight_and_orders_by_created_at() {
+        let (_dir, store) = open_store();
+        let conn = store.conn();
+        let host_id = insert_host(conn);
+        // Reserve but do NOT activate — must not appear in global search.
+        reserve(conn, &ReserveParams {
+            uuid: "inflight-1",
+            host_id,
+            shortname: "shared",
+            repo_slug: "o/r",
+            branch: "main",
+            created_at: 1_000_000,
+        }).unwrap();
+        // Activate two sessions with the same shortname on different hosts.
+        let host2 = crate::host_repo::insert(conn, "host2", "u", "2.2.2.2", 22, 1_000_000).unwrap();
+        reserve(conn, &ReserveParams {
+            uuid: "active-old",
+            host_id,
+            shortname: "shared",
+            repo_slug: "o/r",
+            branch: "main",
+            created_at: 1_000_001,
+        }).unwrap();
+        activate(conn, "active-old", "mux-shared", "/w/a", "tcp", 1_000_002).unwrap();
+        reserve(conn, &ReserveParams {
+            uuid: "active-new",
+            host_id: host2,
+            shortname: "shared",
+            repo_slug: "o/r",
+            branch: "main",
+            created_at: 1_000_003,
+        }).unwrap();
+        activate(conn, "active-new", "mux-shared2", "/w/b", "tcp", 1_000_004).unwrap();
+
+        let rows = get_by_shortname_global(conn, "shared").unwrap();
+        // In-flight row must be excluded; only the two activated rows returned.
+        assert_eq!(rows.len(), 2);
+        // Ordered by created_at ASC.
+        assert_eq!(rows[0].uuid, "active-old");
+        assert_eq!(rows[1].uuid, "active-new");
+    }
+
+    #[test]
     fn reserve_duplicate_uuid_fails() {
         let (_dir, store) = open_store();
         let conn = store.conn();

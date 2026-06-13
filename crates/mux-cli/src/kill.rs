@@ -89,7 +89,7 @@ pub async fn run_kill<S: SshHost>(ctx: KillContext<'_, S>) -> Result<()> {
         }
     }
 
-    // Step 4 — connect to running agent
+    // Step 4 — connect to running agent (no-start: kill must not boot a new agent)
     // TODO: establish SSH port-forward before connecting; use session.transport_mode
     // to select streamlocal vs TCP channel (docs/04 §Transport probing).
     let home = host.home.as_deref().ok_or_else(|| {
@@ -99,7 +99,15 @@ pub async fn run_kill<S: SshHost>(ctx: KillContext<'_, S>) -> Result<()> {
         )
     })?;
     let starter = AgentStarter::new(home, &ctx.ssh);
-    let agent_urls = starter.ensure_running().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let agent_urls = starter
+        .probe_existing()
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no agent running on host '{}'; nothing to kill remotely",
+                host.alias
+            )
+        })?;
 
     // Step 5 — send KillSession RPC
     let rpc = RpcClient::tcp("127.0.0.1", agent_urls.tcp_port());
@@ -110,21 +118,29 @@ pub async fn run_kill<S: SshHost>(ctx: KillContext<'_, S>) -> Result<()> {
         })
         .await;
 
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
     // Step 6 — handle response and conditionally mark dead
     match resp {
         Err(MuxError::AgentError(ref msg)) if msg.starts_with("not_owned") => {
             bail!("mux: session not owned by this client");
         }
+        Err(MuxError::AgentError(ref msg)) if msg.starts_with("not_found") => {
+            // Agent has no record of the session — reconcile local state as dead.
+            session_repo::set_status(ctx.conn, &session.uuid, "dead", now)?;
+            println!("mux: session not found on agent; marked dead locally");
+        }
         Err(e) => return Err(anyhow::anyhow!("{e}")),
         Ok(kill_resp) => {
             if kill_resp.tmux_killed || kill_resp.workdir_removed {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs() as i64;
                 session_repo::set_status(ctx.conn, &session.uuid, "dead", now)?;
+            } else {
+                // No effect: agent reports nothing was killed or removed.
+                println!("mux: nothing to do; session left unchanged");
             }
-            // else: no effect reported → leave local state unchanged (no-op per spec)
         }
     }
 
@@ -201,13 +217,6 @@ mod tests {
                 }),
             }
         }
-
-        fn with_key_err(e: MuxError) -> Self {
-            MockSshHost {
-                responses: RefCell::new(VecDeque::new()),
-                host_key_result: Err(e),
-            }
-        }
     }
 
     impl RemoteExec for MockSshHost {
@@ -253,10 +262,6 @@ mod tests {
             created_at: 1_000_000,
         }).unwrap();
         activate(conn, uuid, "mux-myapp", "/home/user/repo", "tcp", 1_000_001).unwrap();
-    }
-
-    fn trust_host_key(conn: &Connection, host_id: i64) {
-        mux_ssh::trust::trust_fingerprint(conn, host_id, "ssh-ed25519", "FINGERPRINT").unwrap();
     }
 
     // ── resolve_session tests ─────────────────────────────────────────────────
@@ -380,6 +385,37 @@ mod tests {
         // Session still active
         let s = session_repo::get_by_uuid(conn, uuid).unwrap().unwrap();
         assert_eq!(s.status, "active");
+    }
+
+    #[tokio::test]
+    async fn kill_orphaned_session_proceeds_past_status_gate() {
+        // Orphaned sessions must reach the TOFU gate (not be short-circuited by step 2).
+        // Here we use a trusted fingerprint so step 3 passes, but there is no agent
+        // running, so step 4 returns "no agent running" — confirming the orphaned branch
+        // continues past the status gate and only fails at the agent-connection step.
+        let (_dir, store) = open_store();
+        let conn = store.conn();
+        let host_id = insert_host_with_home(conn);
+        let uuid = "99999999-9999-9999-9999-999999999999";
+        insert_active_session(conn, host_id, uuid, "orphanapp");
+        session_repo::set_status(conn, uuid, "orphaned", 2_000_000).unwrap();
+        mux_ssh::trust::trust_fingerprint(conn, host_id, "ssh-ed25519", "FINGERPRINT").unwrap();
+
+        // MockSshHost with trusted key, no responses queued (probe_existing reads lock → not found)
+        let ssh = MockSshHost::with_key("FINGERPRINT", vec![
+            // read_lock: cat returns empty (no lock file)
+            (0, "".to_owned(), "".to_owned()),
+        ]);
+        let ctx = KillContext { conn, ssh, selector: uuid.to_owned(), is_interactive: false };
+        let err = run_kill(ctx).await.unwrap_err();
+        // Must reach step 4 and fail at agent-not-running, not at the status gate
+        assert!(
+            err.to_string().contains("no agent running") || err.to_string().contains("no more responses"),
+            "expected agent-not-running or mock-exhausted error, got: {err}"
+        );
+        // Status must NOT have been mutated
+        let s = session_repo::get_by_uuid(conn, uuid).unwrap().unwrap();
+        assert_eq!(s.status, "orphaned");
     }
 
     // NOTE: run_kill steps 4-6 (agent connection + RPC) require a live SSH host and
