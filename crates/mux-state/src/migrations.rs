@@ -6,15 +6,22 @@
 //! - Forward-only; rollbacks are not supported.
 //! - Idempotent: `CREATE TABLE IF NOT EXISTS` and `INSERT OR IGNORE` throughout.
 //! - Version tracked in `_migrations (id, applied_at)`.
-//! - Each migration SQL runs within its own `BEGIN`/`COMMIT` (included in the file).
+//! - The runner owns the transaction and the version row; migration SQL files are
+//!   pure DDL with no `BEGIN`/`COMMIT` and no `_migrations` INSERT.
 
 use anyhow::{Context, Result};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 /// Ordered list of (migration_id, SQL).
 ///
 /// Migration files are embedded at compile time.  Add new entries here as
 /// additional `migrations/NNN-*.sql` files are created.
+///
+/// # Convention
+/// Each SQL file must contain pure DDL only — no `BEGIN`/`COMMIT` and no
+/// `INSERT INTO _migrations`.  The runner owns transaction control and
+/// version recording so that version tracking is always atomic with the DDL
+/// and cannot be forgotten by a future migration author.
 static MIGRATIONS: &[(u32, &str)] = &[(
     1,
     include_str!("../../../migrations/001-initial-schema.sql"),
@@ -22,13 +29,12 @@ static MIGRATIONS: &[(u32, &str)] = &[(
 
 /// Apply any pending migrations to `conn`.
 ///
-/// Ensures `_migrations` exists before querying it, then runs each migration
-/// whose `id` is not yet recorded.  Safe to call on every `Store::open` — all
-/// already-applied migrations are skipped in O(1) per migration.
+/// Ensures `_migrations` exists before querying it, then for each un-applied
+/// migration: opens a transaction, executes the DDL, records the version row,
+/// and commits — all atomically.  Safe to call on every `Store::open`.
 pub fn run(conn: &Connection) -> Result<()> {
-    // Pre-create _migrations so the SELECT check works on a brand-new database
-    // before any migration has run.  The migrations themselves also create it
-    // with IF NOT EXISTS, so this is idempotent.
+    // Pre-create _migrations so the SELECT check below works on a brand-new
+    // database before any migration has run.
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS _migrations (
              id         INTEGER PRIMARY KEY,
@@ -38,17 +44,35 @@ pub fn run(conn: &Connection) -> Result<()> {
     .context("ensure _migrations table exists")?;
 
     for &(id, sql) in MIGRATIONS {
-        let already_applied: bool = conn
+        // Use .optional() to distinguish "no row" (not yet applied) from a
+        // real database error (lock, I/O, corruption) rather than collapsing
+        // both into unwrap_or(false).
+        let already_applied = conn
             .query_row(
                 "SELECT 1 FROM _migrations WHERE id = ?1",
                 rusqlite::params![id],
-                |_| Ok(true),
+                |_| Ok(()),
             )
-            .unwrap_or(false);
+            .optional()
+            .with_context(|| format!("check whether migration {id} is applied"))?
+            .is_some();
 
         if !already_applied {
-            conn.execute_batch(sql)
-                .with_context(|| format!("apply migration {id}"))?;
+            // The runner owns the transaction so that DDL + version recording
+            // are atomic.  unchecked_transaction works with &self.
+            let tx = conn
+                .unchecked_transaction()
+                .with_context(|| format!("begin transaction for migration {id}"))?;
+            tx.execute_batch(sql)
+                .with_context(|| format!("apply migration {id} DDL"))?;
+            tx.execute(
+                "INSERT INTO _migrations (id, applied_at) \
+                 VALUES (?1, CAST(strftime('%s', 'now') AS INTEGER))",
+                rusqlite::params![id],
+            )
+            .with_context(|| format!("record migration {id}"))?;
+            tx.commit()
+                .with_context(|| format!("commit migration {id}"))?;
         }
     }
     Ok(())

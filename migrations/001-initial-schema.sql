@@ -2,18 +2,14 @@
 -- Implements: docs/03 §SQLite setup, §Hosts table, §Known host fingerprints table,
 --             §Agent versions table, §Sessions table
 --
+-- This file is pure DDL: no BEGIN/COMMIT and no _migrations INSERT.
+-- The migration runner owns transaction control and version recording.
+--
 -- Runner requirements before applying:
 --   PRAGMA foreign_keys = ON;   (required for ON DELETE CASCADE to function)
 --   PRAGMA journal_mode = WAL;
 --   PRAGMA busy_timeout = 5000;
 --   PRAGMA synchronous = NORMAL;
-
-BEGIN;
-
-CREATE TABLE IF NOT EXISTS _migrations (
-    id         INTEGER PRIMARY KEY,
-    applied_at INTEGER NOT NULL   -- Unix seconds
-);
 
 CREATE TABLE IF NOT EXISTS hosts (
     id          INTEGER PRIMARY KEY,
@@ -63,10 +59,3 @@ CREATE TABLE IF NOT EXISTS sessions (
 -- Indexes for hot-path queries (per-host session listing, shortname resolution)
 CREATE INDEX IF NOT EXISTS idx_sessions_host ON sessions (host_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_shortname ON sessions (shortname);
-
--- Record this migration as applied. The SQL file owns the INSERT;
--- the runner checks SELECT id FROM _migrations WHERE id = 1 before applying.
-INSERT OR IGNORE INTO _migrations (id, applied_at)
-    VALUES (1, CAST(strftime('%s', 'now') AS INTEGER));
-
-COMMIT;

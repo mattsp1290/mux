@@ -40,7 +40,12 @@ impl Store {
         // 2. Open the SQLite connection (creates the file if absent).
         let conn = Connection::open(path).with_context(|| format!("open database {path:?}"))?;
 
-        // 3. Restrict file permissions.
+        // 3. Restrict file permissions on the DB file itself.
+        // NOTE: WAL mode (step 4) also creates `-wal` and `-shm` sidecar files
+        // which are not individually chmod'd here — they inherit the process
+        // umask.  The 0700 directory mode (step 1) is the real access-control
+        // boundary for the whole store.  The 0600 on `mux.db` is defense-in-depth
+        // for the case where the directory is traversable (e.g. a shared /tmp).
         #[cfg(unix)]
         set_file_mode(path)?;
 
