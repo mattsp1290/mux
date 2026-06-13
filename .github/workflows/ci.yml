@@ -1,0 +1,177 @@
+name: CI
+
+# Separate gates per docs/08: fmt, lint, unit tests, integration tests, artifacts.
+# Integration and artifact gates run on main and tags; unit/fmt/lint run on every push.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+# ── Gate 1: Format ────────────────────────────────────────────────────────────
+
+jobs:
+  fmt:
+    name: Format check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        # TODO: pin dtolnay/rust-toolchain to a commit SHA for supply-chain safety
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+
+# ── Gate 2: Lint ──────────────────────────────────────────────────────────────
+
+  lint:
+    name: Clippy
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        # TODO: pin dtolnay/rust-toolchain to a commit SHA for supply-chain safety
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: cargo clippy -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+# ── Gate 3: Unit tests ────────────────────────────────────────────────────────
+
+  unit:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        # TODO: pin dtolnay/rust-toolchain to a commit SHA for supply-chain safety
+        uses: dtolnay/rust-toolchain@stable
+      - name: cargo test --workspace
+        run: cargo test --workspace
+
+# ── Gate 4: Integration tests ─────────────────────────────────────────────────
+# Runs on main, tags, and PRs with the 'run-integration-tests' label.
+# Docker is available on ubuntu-latest runners by default.
+
+  integration:
+    name: Integration tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    if: >-
+      github.ref == 'refs/heads/main' ||
+      startsWith(github.ref, 'refs/tags/') ||
+      contains(github.event.pull_request.labels.*.name, 'run-integration-tests')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        # TODO: pin dtolnay/rust-toolchain to a commit SHA for supply-chain safety
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build mux binary
+        run: cargo build -p mux
+
+      - name: Build Docker test host image
+        run: docker compose -f docker/test-host/docker-compose.yml build
+
+      - name: Start test hosts
+        run: docker compose -f docker/test-host/docker-compose.yml up -d
+
+      - name: Run integration tests
+        env:
+          MUX_BIN: ${{ github.workspace }}/target/debug/mux
+        run: |
+          cargo test -p mux-integration-tests \
+            --test integration \
+            --features integration-tests \
+            -- --test-threads=1
+
+      - name: Stop test hosts
+        if: always()
+        run: docker compose -f docker/test-host/docker-compose.yml down
+
+# ── Gate 5: Artifact checks ───────────────────────────────────────────────────
+# Build release binaries and verify size + executable bit.
+# Mirrors the release workflow's build matrix to catch regressions before tag time.
+# Runs on main and tags only (same as the release workflow's build conditions).
+
+  artifact-mux-cli:
+    name: Artifact check (mux CLI)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    if: >-
+      github.ref == 'refs/heads/main' ||
+      startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        # TODO: pin dtolnay/rust-toolchain to a commit SHA for supply-chain safety
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build mux CLI (release)
+        run: cargo build --release -p mux
+
+      - name: Verify artifact
+        run: |
+          artifact=target/release/mux
+          test -x "$artifact" || (echo "artifact not executable" && exit 1)
+          size=$(stat -c%s "$artifact")
+          test "$size" -gt 0 || (echo "artifact is zero bytes" && exit 1)
+          echo "mux ok: ${size} bytes"
+
+  artifact-mux-agent:
+    name: Artifact check (mux-agent ${{ matrix.target }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    if: >-
+      github.ref == 'refs/heads/main' ||
+      startsWith(github.ref, 'refs/tags/')
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            artifact: mux-agent-amd64
+          - target: aarch64-unknown-linux-musl
+            artifact: mux-agent-arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        # TODO: pin dtolnay/rust-toolchain to a commit SHA for supply-chain safety
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cross
+        run: cargo install cross --version 0.2.5
+
+      - name: Build mux-agent (${{ matrix.target }})
+        run: cross build --release --target ${{ matrix.target }} -p mux-agent
+
+      - name: Verify artifact
+        run: |
+          artifact=target/${{ matrix.target }}/release/mux-agent
+          test -x "$artifact" || (echo "artifact not executable" && exit 1)
+          size=$(stat -c%s "$artifact")
+          test "$size" -gt 0 || (echo "artifact is zero bytes" && exit 1)
+          echo "${{ matrix.artifact }} ok: ${size} bytes"
