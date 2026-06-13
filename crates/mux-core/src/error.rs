@@ -140,6 +140,11 @@ pub enum MuxError {
     #[error("agent error: {0}")]
     AgentError(String),
 
+    /// Agent did not become ready within the startup timeout.
+    /// Hint: "Check agent.log on the remote host for details."
+    #[error("agent start timed out; last log:\n{log_tail}")]
+    AgentStartTimeout { log_tail: String },
+
     /// RPC transport or protocol failure.
     #[error("RPC error: {0}")]
     RpcError(String),
@@ -178,6 +183,9 @@ impl MuxError {
             MuxError::InvalidForceTransport(_) => {
                 Some("Valid values are 'streamlocal' and 'tcp'.")
             }
+            MuxError::AgentStartTimeout { .. } => {
+                Some("Check agent.log on the remote host.")
+            }
             _ => None,
         }
     }
@@ -197,6 +205,7 @@ impl MuxError {
             MuxError::SessionAlreadyExists { .. } => "session_already_exists",
             MuxError::ShortnameExhausted => "shortname_exhausted",
             MuxError::RpcError(_) | MuxError::AgentError(_) => "rpc_error",
+            MuxError::AgentStartTimeout { .. } => "agent_start_timeout",
             MuxError::InvalidForceTransport(_) => "invalid_force_transport",
             MuxError::Other(_) => "other",
             // Remaining variants: user-input or host errors without a dedicated spec category.
@@ -228,6 +237,7 @@ impl MuxError {
             | MuxError::TofuNonInteractive
             | MuxError::HostKeyRejected
             | MuxError::AgentError(_)
+            | MuxError::AgentStartTimeout { .. }
             | MuxError::RpcError(_)
             | MuxError::InvalidForceTransport(_) => 1,
             MuxError::Other(_) => 2,
@@ -576,6 +586,7 @@ mod tests {
             "session_already_exists",
             "shortname_exhausted",
             "rpc_error",
+            "agent_start_timeout",
             "other",
         ];
         let cases: &[MuxError] = &[
@@ -591,6 +602,7 @@ mod tests {
             },
             MuxError::ShortnameExhausted,
             MuxError::RpcError("x".into()),
+            MuxError::AgentStartTimeout { log_tail: String::new() },
             MuxError::Other(anyhow!("boom")),
         ];
         for e in cases {
@@ -649,6 +661,36 @@ mod tests {
 
     // ── No mux: prefix in error messages ─────────────────────────────────────
 
+    // ── AgentStartTimeout ────────────────────────────────────────────────────
+
+    #[test]
+    fn agent_start_timeout_display_contains_log_tail() {
+        let e = MuxError::AgentStartTimeout {
+            log_tail: "fatal: port bind failed".into(),
+        };
+        let s = e.to_string();
+        assert!(s.contains("agent start timed out"), "expected prefix, got: {s}");
+        assert!(s.contains("fatal: port bind failed"), "expected log tail, got: {s}");
+    }
+
+    #[test]
+    fn agent_start_timeout_hint() {
+        let e = MuxError::AgentStartTimeout { log_tail: String::new() };
+        assert_eq!(e.hint(), Some("Check agent.log on the remote host."));
+    }
+
+    #[test]
+    fn agent_start_timeout_category() {
+        let e = MuxError::AgentStartTimeout { log_tail: String::new() };
+        assert_eq!(e.category(), "agent_start_timeout");
+    }
+
+    #[test]
+    fn agent_start_timeout_exit_code() {
+        let e = MuxError::AgentStartTimeout { log_tail: String::new() };
+        assert_eq!(e.exit_code(), 1);
+    }
+
     #[test]
     fn no_variant_display_starts_with_mux_prefix() {
         // Guard against double-prefixing: the CLI adds "mux: " at the boundary.
@@ -663,6 +705,7 @@ mod tests {
             MuxError::SshAgentNotForwarded,
             MuxError::HostKeyMismatch,
             MuxError::RpcError("x".into()),
+            MuxError::AgentStartTimeout { log_tail: String::new() },
             MuxError::Other(anyhow!("boom")),
         ];
         for e in variants {
