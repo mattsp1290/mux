@@ -10,6 +10,7 @@ pub mod create;
 pub mod host;
 pub mod kill;
 pub mod mux_home;
+pub mod status;
 
 /// The full mux CLI definition, exported so `mux-cli` can generate completions.
 #[derive(Debug, Parser)]
@@ -56,7 +57,10 @@ pub enum Command {
     /// List sessions
     List,
     /// Show session status
-    Status,
+    Status {
+        /// UUID or shortname of the session
+        selector: String,
+    },
     /// Kill a session
     Kill {
         /// UUID or shortname of the session to kill
@@ -136,7 +140,8 @@ pub async fn run(command: Command, mux_home: PathBuf) -> Result<()> {
         // TODO: wire to prepare_attach + exec once a real SshHost SSH impl lands.
         Command::Attach { .. } => anyhow::bail!("mux attach: SSH execution not yet implemented"),
         Command::List => todo!("mux list"),
-        Command::Status => todo!("mux status"),
+        // TODO: wire to run_status once a real RemoteExec SSH impl lands.
+        Command::Status { .. } => anyhow::bail!("mux status: SSH execution not yet implemented"),
         // TODO: wire to run_kill once a real SshHost SSH impl lands (currently no
         // production SSH executor exists; kill is tested via MockSshHost in isolation).
         Command::Kill { .. } => anyhow::bail!("mux kill: SSH execution not yet implemented"),
