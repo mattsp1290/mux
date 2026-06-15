@@ -301,7 +301,11 @@ pub async fn run_create<S: SshHost>(ctx: CreateContext<'_, S>) -> Result<CreateR
 
     // ── Step 7: Clone ─────────────────────────────────────────────────────────
 
-    let clone_url = ctx.repo.clone_url_for(&ctx.host.addr);
+    // Bare `owner/repo` slugs default to GitHub; the SSH host address is the
+    // deploy target, not the git remote. (Regression from the Go version, which
+    // defaulted to github.com — cloning from `ctx.host.addr` makes the remote
+    // try to fetch from itself and fails host-key verification.)
+    let clone_url = ctx.repo.clone_url_for("github.com");
     let clone_cmd = format!(
         "GIT_TERMINAL_PROMPT=0 git clone --branch {} {} {}",
         sh_quote(&ctx.branch),
